@@ -52,12 +52,17 @@ func NewDiscord(config map[string]interface{}, appCfg *config.App) *Discord {
 		klog.InfoS("initializing discord with missing id or token")
 		return nil
 	}
-	klog.InfoS("initializing discord with webhook url", "webhook", webhook)
+	klog.InfoS("initializing discord with webhook configured")
 
 	webhookToken := webhookList[len(webhookList)-1]
 	webhookID := webhookList[len(webhookList)-2]
 
-	discordClient, _ := discordgo.New("")
+	discordClient, err := discordgo.New("")
+	if err != nil {
+		klog.ErrorS(err, "initializing discord client")
+		return nil
+	}
+	discordClient.Client = k8s.GetDefaultClient()
 
 	title, _ := config["title"].(string)
 	text, _ := config["text"].(string)
@@ -79,25 +84,24 @@ func (d *Discord) Name() string {
 
 // Verify checks webhook credentials by issuing a GET to the webhook URL.
 func (d *Discord) Verify() error {
-	client := k8s.GetDefaultClient()
 	url := fmt.Sprintf("https://discord.com/api/webhooks/%s/%s", d.id, d.token)
-	resp, err := client.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf(
-			"discord webhook GET returned status %d",
-			resp.StatusCode,
-		)
-	}
-	return nil
+	_, err := util.Send(util.Request{
+		Provider: "Discord",
+		Method:   http.MethodGet,
+		URL:      url,
+	})
+	return err
 }
 
 // SendEvent sends event to the provider
 func (d *Discord) SendEvent(ev *event.Event) error {
-	klog.V(4).InfoS("sending to discord event", "event", ev)
+	klog.V(4).InfoS(
+		"sending to discord event",
+		"namespace", ev.Namespace,
+		"name", ev.PodName,
+		"reason", ev.Reason,
+		"action", ev.Action,
+	)
 
 	// initialize fields with basic info
 	fields := []*discordgo.MessageEmbedField{}
@@ -212,7 +216,9 @@ func (d *Discord) SendEvent(ev *event.Event) error {
 					},
 				},
 			},
-		})
+		},
+		discordgo.WithContext(util.ProviderContext(d.Name())),
+	)
 	return wrapDiscordRateLimit(err)
 }
 
@@ -225,7 +231,9 @@ func (d *Discord) SendMessage(msg string) error {
 		false,
 		&discordgo.WebhookParams{
 			Content: msg,
-		})
+		},
+		discordgo.WithContext(util.ProviderContext(d.Name())),
+	)
 	return wrapDiscordRateLimit(err)
 }
 

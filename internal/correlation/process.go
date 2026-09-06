@@ -21,6 +21,10 @@ func (e *Engine) Process(
 	cs *model.ContainerState,
 ) (*model.Incident, model.IncidentAction) {
 	e.mu.Lock()
+	if e.frozen {
+		e.mu.Unlock()
+		return nil, model.ActionSkip
+	}
 	inc, action := e.processLocked(ev, owner, cs)
 	if inc != nil {
 		inc = inc.Clone()
@@ -74,6 +78,7 @@ func (e *Engine) processLocked(
 	if c := e.attribute(ev, owner, key, res); c.kind != causeNone {
 		return e.recordSymptom(c, ev, owner, cs, key, res, now)
 	}
+	e.rememberPodResource(key, ev)
 
 	// 3. cooldown
 	if e.skipByCooldown(key, ev) {
@@ -137,13 +142,14 @@ func (e *Engine) newIncident(
 ) *model.Incident {
 	inc := &model.Incident{
 		Subject: model.Subject{
-			ID:        fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(key))),
-			Key:       key,
-			Reason:    ev.Reason,
-			Namespace: ev.Namespace,
-			Resource:  res,
-			Name:      owner,
-			NodeName:  ev.NodeName,
+			ID:          fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(key))),
+			Fingerprint: StableFingerprint(ev, owner, cs),
+			Key:         key,
+			Reason:      ev.Reason,
+			Namespace:   ev.Namespace,
+			Resource:    res,
+			Name:        owner,
+			NodeName:    ev.NodeName,
 		},
 		Status: model.Status{
 			Count:      1,
@@ -163,8 +169,9 @@ func (e *Engine) newIncident(
 	if ev.ContainerName != "" && ev.ContainerName != "." {
 		inc.Containers[ev.ContainerName] = true
 	}
-	// Bare pods (no owner) are identified by their own name.
-	if owner == "" {
+	// Keep the human-facing incident name as the concrete Pod name even when
+	// correlation uses a UID or explicit lineage internally.
+	if owner == "" || (ev.Resource == "pod" && ev.OwnerKind == "" && owner == ev.PodName) {
 		inc.Name = ev.PodName
 	}
 	inc.LastContainerState = cs
@@ -175,27 +182,47 @@ func (e *Engine) newIncident(
 	if url, ok := e.config.Runbooks[ev.Reason]; ok {
 		inc.Runbook = url
 	}
-	if e.config.EscalationEnabled && cs != nil {
-		cur := int(cs.RestartCount)
-		if t := crossedTier(-1, cur, e.config.EscalationTiers); t >= 0 {
-			ev.Severity = severityForTier(t, inc.Severity)
-		} else if ev.Severity == "" {
-			// seed from the absolute threshold when no tier is crossed at
-			// startup
-			for i := len(e.config.EscalationTiers) - 1; i >= 0; i-- {
-				if cur >= e.config.EscalationTiers[i] {
-					ev.Severity = severityForTier(i, inc.Severity)
-					break
-				}
-			}
-		}
-	}
+	e.applyIncidentEscalation(&ev, inc, cs)
 	e.config.Enricher.Enrich(&ev, inc)
 
 	// Topology is impact, not explanation. It used to be appended to the
 	// hint as prose, where it repeated what the diagnosis block already says
 	// and made the hint unreadable. Keep it structured; renderers decide how
 	// to show it.
+	e.attachIncidentRelations(inc, ev, owner, res)
+
+	return inc
+}
+
+func (e *Engine) applyIncidentEscalation(
+	ev *event.Event,
+	inc *model.Incident,
+	cs *model.ContainerState,
+) {
+	if !e.config.EscalationEnabled || cs == nil {
+		return
+	}
+	cur := int(cs.RestartCount)
+	if tier := crossedTier(-1, cur, e.config.EscalationTiers); tier >= 0 {
+		ev.Severity = severityForTier(tier, inc.Severity)
+		return
+	}
+	if ev.Severity != "" {
+		return
+	}
+	for i := len(e.config.EscalationTiers) - 1; i >= 0; i-- {
+		if cur >= e.config.EscalationTiers[i] {
+			ev.Severity = severityForTier(i, inc.Severity)
+			break
+		}
+	}
+}
+
+func (e *Engine) attachIncidentRelations(
+	inc *model.Incident,
+	ev event.Event,
+	owner, res string,
+) {
 	if deps := e.findDependentServices(ev.Namespace, ev.Labels); len(deps) > 0 {
 		sort.Strings(deps)
 		inc.AffectedServices = deps
@@ -203,6 +230,4 @@ func (e *Engine) newIncident(
 	if res == "pod" && owner != "" && !e.isOwnerHealthy(inc) {
 		inc.OwnerUnhealthy = true
 	}
-
-	return inc
 }

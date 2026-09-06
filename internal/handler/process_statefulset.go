@@ -7,9 +7,11 @@ import (
 	"github.com/abahmed/kwatch/internal/constant"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/tools/cache"
 
+	"github.com/abahmed/kwatch/internal/correlation"
 	"github.com/abahmed/kwatch/internal/event"
 )
 
@@ -19,7 +21,7 @@ func DetectStatefulSetIssue(ss *appsv1.StatefulSet) *event.Signal {
 	if ss == nil {
 		return nil
 	}
-	if ss.Status.Replicas > 0 && ss.Status.ReadyReplicas < ss.Status.Replicas {
+	if statefulSetUnavailable(ss) {
 		return &event.Signal{
 			Resource:  "statefulset",
 			Reason:    constant.ReasonStsUnavailable,
@@ -32,13 +34,35 @@ func DetectStatefulSetIssue(ss *appsv1.StatefulSet) *event.Signal {
 	return nil
 }
 
+func DetectStatefulSetConditions(ss *appsv1.StatefulSet) []*event.Signal {
+	if ss == nil {
+		return nil
+	}
+	owner := ss.Namespace + "/" + ss.Name
+	var out []*event.Signal
+	for _, condition := range ss.Status.Conditions {
+		if condition.Status == corev1.ConditionTrue {
+			continue
+		}
+		hint := string(condition.Type) + ": " + condition.Reason
+		if condition.Message != "" {
+			hint += " — " + condition.Message
+		}
+		out = append(out, &event.Signal{Resource: "statefulset", Namespace: ss.Namespace,
+			PodName: ss.Name, Owner: owner, Reason: constant.ReasonStatefulSetCondition,
+			Labels: ss.Labels, Hint: hint})
+	}
+	return out
+}
+
 func stsAvailabilityHint(ss *appsv1.StatefulSet) string {
-	notReady := ss.Status.Replicas - ss.Status.ReadyReplicas
+	desired := statefulSetReplicas(ss)
+	notReady := desired - ss.Status.ReadyReplicas
 	return fmt.Sprintf(
 		"%d/%d pods not ready (ready: %d) — check PVC, pod status, or rollout "+
 			"progress",
 		notReady,
-		ss.Status.Replicas,
+		desired,
 		ss.Status.ReadyReplicas,
 	)
 }
@@ -85,10 +109,24 @@ func (h *handler) ProcessStatefulSetObject(
 		h.correlator.ResolveByResource("statefulset", ss.Namespace+"/"+ss.Name)
 		return nil
 	}
+	if h.inMaintenance(ss.Annotations) {
+		h.clearFirstUnavailableSts(ss.Namespace + "/" + ss.Name)
+		h.correlator.ResolveByResource("statefulset", ss.Namespace+"/"+ss.Name)
+		return nil
+	}
 
 	key := ss.Namespace + "/" + ss.Name
+	conditionSignals := DetectStatefulSetConditions(ss)
+	for _, sig := range conditionSignals {
+		h.signalEvent(sig)
+	}
+	if len(conditionSignals) == 0 {
+		h.correlator.MarkResolved(correlation.BuildKey(
+			ss.Namespace, key, constant.ReasonStatefulSetCondition, "",
+		))
+	}
 
-	if ss.Status.Replicas > 0 && ss.Status.ReadyReplicas < ss.Status.Replicas {
+	if statefulSetUnavailable(ss) {
 		first := h.markFirstUnavailableSts(key)
 
 		settled := ss.Status.ObservedGeneration >= ss.Generation &&
@@ -100,9 +138,12 @@ func (h *handler) ProcessStatefulSetObject(
 			}
 		}
 
-		sustained := time.Duration(
+		sustained := adaptiveSustained(
 			h.config.StatefulSetMonitor.SustainedMinutes,
-		) * time.Minute
+			h.config.AdaptiveThresholds,
+			statefulSetReplicas(ss),
+			statefulSetReplicas(ss)-ss.Status.ReadyReplicas,
+		)
 		if sustained > 0 && h.now().Sub(first) < sustained {
 			return nil
 		}
@@ -117,10 +158,31 @@ func (h *handler) ProcessStatefulSetObject(
 		})
 		return nil
 	}
-
 	h.clearFirstUnavailableSts(key)
-	h.correlator.ResolveByResource("statefulset", key)
+	if len(conditionSignals) == 0 {
+		h.correlator.ResolveByResource("statefulset", key)
+	}
 	return nil
+}
+
+func statefulSetReplicas(ss *appsv1.StatefulSet) int32 {
+	if ss == nil {
+		return 0
+	}
+	if ss.Spec.Replicas == nil {
+		return ss.Status.Replicas
+	}
+	return *ss.Spec.Replicas
+}
+
+func statefulSetUnavailable(ss *appsv1.StatefulSet) bool {
+	if ss == nil {
+		return false
+	}
+	if ss.Spec.Replicas == nil {
+		return ss.Status.Replicas > 0 && ss.Status.ReadyReplicas < ss.Status.Replicas
+	}
+	return *ss.Spec.Replicas > 0 && ss.Status.ReadyReplicas < *ss.Spec.Replicas
 }
 
 func (h *handler) markFirstUnavailableSts(key string) time.Time {

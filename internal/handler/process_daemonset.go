@@ -7,9 +7,11 @@ import (
 	"github.com/abahmed/kwatch/internal/constant"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/tools/cache"
 
+	"github.com/abahmed/kwatch/internal/correlation"
 	"github.com/abahmed/kwatch/internal/event"
 )
 
@@ -30,6 +32,27 @@ func DetectDaemonSetIssue(ds *appsv1.DaemonSet) *event.Signal {
 		}
 	}
 	return nil
+}
+
+func DetectDaemonSetConditions(ds *appsv1.DaemonSet) []*event.Signal {
+	if ds == nil {
+		return nil
+	}
+	owner := ds.Namespace + "/" + ds.Name
+	var out []*event.Signal
+	for _, condition := range ds.Status.Conditions {
+		if condition.Status == corev1.ConditionTrue {
+			continue
+		}
+		hint := string(condition.Type) + ": " + condition.Reason
+		if condition.Message != "" {
+			hint += " — " + condition.Message
+		}
+		out = append(out, &event.Signal{Resource: "daemonset", Namespace: ds.Namespace,
+			PodName: ds.Name, Owner: owner, Reason: constant.ReasonDaemonSetCondition,
+			Labels: ds.Labels, Hint: hint})
+	}
+	return out
 }
 
 func availabilityHint(ds *appsv1.DaemonSet) string {
@@ -86,8 +109,22 @@ func (h *handler) ProcessDaemonSetObject(
 		h.correlator.ResolveByResource("daemonset", ds.Namespace+"/"+ds.Name)
 		return nil
 	}
+	if h.inMaintenance(ds.Annotations) {
+		h.clearFirstUnavailableDS(ds.Namespace + "/" + ds.Name)
+		h.correlator.ResolveByResource("daemonset", ds.Namespace+"/"+ds.Name)
+		return nil
+	}
 
 	key := ds.Namespace + "/" + ds.Name
+	conditionSignals := DetectDaemonSetConditions(ds)
+	for _, sig := range conditionSignals {
+		h.signalEvent(sig)
+	}
+	if len(conditionSignals) == 0 {
+		h.correlator.MarkResolved(correlation.BuildKey(
+			ds.Namespace, key, constant.ReasonDaemonSetCondition, "",
+		))
+	}
 
 	if ds.Status.DesiredNumberScheduled > 0 && ds.Status.NumberUnavailable > 0 {
 		// Node-driven inhibition: if there are at least as many active node
@@ -97,7 +134,9 @@ func (h *handler) ProcessDaemonSetObject(
 			ds.Status.NumberUnavailable,
 		) {
 			h.clearFirstUnavailableDS(key)
-			h.correlator.ResolveByResource("daemonset", key)
+			if len(conditionSignals) == 0 {
+				h.correlator.ResolveByResource("daemonset", key)
+			}
 			return nil
 		}
 
@@ -117,9 +156,13 @@ func (h *handler) ProcessDaemonSetObject(
 			// still unsettled past the grace → stuck rollout; fall through
 		}
 
-		sustained := time.Duration(
+		unavailable := ds.Status.DesiredNumberScheduled - ds.Status.NumberReady
+		sustained := adaptiveSustained(
 			h.config.DaemonSetMonitor.SustainedMinutes,
-		) * time.Minute
+			h.config.AdaptiveThresholds,
+			ds.Status.DesiredNumberScheduled,
+			unavailable,
+		)
 		if sustained > 0 && h.now().Sub(first) < sustained {
 			return nil
 		}
@@ -134,9 +177,10 @@ func (h *handler) ProcessDaemonSetObject(
 		})
 		return nil
 	}
-
 	h.clearFirstUnavailableDS(key)
-	h.correlator.ResolveByResource("daemonset", key)
+	if len(conditionSignals) == 0 {
+		h.correlator.ResolveByResource("daemonset", key)
+	}
 	return nil
 }
 

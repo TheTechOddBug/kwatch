@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
 )
 
@@ -25,7 +26,14 @@ func LintStrict() error {
 	if err != nil {
 		return err
 	}
+	if err := validateSecretReferences(string(raw)); err != nil {
+		return err
+	}
 	expanded, err := expandEnv(string(raw))
+	if err != nil {
+		return err
+	}
+	expanded, err = expandFileRefs(expanded)
 	if err != nil {
 		return err
 	}
@@ -43,6 +51,7 @@ func LintStrict() error {
 // not set in the environment is reported as an error rather than silently
 // expanding to an empty string, which would corrupt the configuration.
 var envVarRe = regexp.MustCompile(`\$\{(\w+)\}`)
+var fileRefRe = regexp.MustCompile(`^\$\{file:(/[^}]*)\}$`)
 
 func expandEnv(s string) (string, error) {
 	unset := map[string]bool{}
@@ -69,6 +78,45 @@ func expandEnv(s string) (string, error) {
 	return out, nil
 }
 
+// expandFileRefs resolves exact ${file:/path} scalar references after YAML
+// parsing so secret values remain correctly escaped when YAML is re-encoded.
+func expandFileRefs(s string) (string, error) {
+	if strings.TrimSpace(s) == "" {
+		return s, nil
+	}
+	var document yaml.Node
+	if err := yaml.Unmarshal([]byte(s), &document); err != nil {
+		return "", err
+	}
+	if err := resolveFileRefNodes(&document); err != nil {
+		return "", err
+	}
+	resolved, err := yaml.Marshal(&document)
+	if err != nil {
+		return "", err
+	}
+	return string(resolved), nil
+}
+
+func resolveFileRefNodes(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!str" {
+		match := fileRefRe.FindStringSubmatch(node.Value)
+		if match != nil {
+			value, err := os.ReadFile(match[1]) // #nosec G304 -- operator-selected config reference
+			if err != nil {
+				return fmt.Errorf("config file reference %q could not be read: %w", match[1], err)
+			}
+			node.Value = strings.TrimRight(string(value), "\r\n")
+		}
+	}
+	for _, child := range node.Content {
+		if err := resolveFileRefNodes(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // LoadConfig loads yaml configuration from file if provided, otherwise
 // loads default configuration
 // parseConfigFile reads CONFIG_FILE and unmarshals it over a fresh default
@@ -93,10 +141,19 @@ func parseConfigFile() (*Config, error) {
 		klog.InfoS("unable to load config file", "error", err.Error())
 		return nil, err
 	}
+	if err := validateSecretReferences(string(yamlFile)); err != nil {
+		klog.ErrorS(err, "unsafe credential in config", "file", configFile)
+		return nil, err
+	}
 
 	expanded, err := expandEnv(string(yamlFile))
 	if err != nil {
 		klog.ErrorS(err, "failed to expand environment variables in config", "file", configFile)
+		return nil, err
+	}
+	expanded, err = expandFileRefs(expanded)
+	if err != nil {
+		klog.ErrorS(err, "failed to resolve file references in config", "file", configFile)
 		return nil, err
 	}
 
@@ -113,6 +170,8 @@ func parseConfigFile() (*Config, error) {
 // prepareAllowForbidLists splits namespace and reason lists and validates that
 // allow and forbid sides are mutually exclusive.
 func prepareAllowForbidLists(config *Config, errs []error) []error {
+	errs = append(errs, validateNamespaceEntries(config.Namespaces)...)
+	errs = append(errs, validateReasonEntries(config.Reasons)...)
 	// Parse namespace allow/forbid lists
 	config.AllowedNamespaces, config.ForbiddenNamespaces =
 		getAllowForbidSlices(config.Namespaces)
@@ -135,6 +194,35 @@ func prepareAllowForbidLists(config *Config, errs []error) []error {
 			errors.New("either allowed or forbidden reasons must be set, can't set both"))
 	}
 
+	return errs
+}
+
+func validateNamespaceEntries(items []string) []error {
+	var errs []error
+	for _, item := range items {
+		name := strings.TrimPrefix(item, "!")
+		if name == "" {
+			errs = append(errs, errors.New("namespaces entries must not be empty"))
+			continue
+		}
+		if problems := utilvalidation.IsDNS1123Label(name); len(problems) > 0 {
+			errs = append(errs, fmt.Errorf(
+				"invalid namespace %q: %s",
+				name,
+				strings.Join(problems, ", "),
+			))
+		}
+	}
+	return errs
+}
+
+func validateReasonEntries(items []string) []error {
+	var errs []error
+	for _, item := range items {
+		if strings.TrimSpace(strings.TrimPrefix(item, "!")) == "" {
+			errs = append(errs, errors.New("reasons entries must not be empty"))
+		}
+	}
 	return errs
 }
 

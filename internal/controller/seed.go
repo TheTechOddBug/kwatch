@@ -53,8 +53,14 @@ func (r *baselineRecorder) add(key model.IncidentKey, pod string) {
 
 func (r *baselineRecorder) seed(sig *event.Signal) {
 	ev := event.Event{
-		Namespace: sig.Namespace,
-		Reason:    sig.Reason,
+		Resource:        sig.Resource,
+		Namespace:       sig.Namespace,
+		Reason:          sig.Reason,
+		PodName:         sig.PodName,
+		PodUID:          sig.PodUID,
+		PodLineageID:    sig.PodLineageID,
+		PodGenerateName: sig.PodGenerateName,
+		OwnerKind:       sig.OwnerKind,
 	}
 	key := correlation.IncidentKey(ev, sig.Owner, nil)
 	r.add(key, sig.PodName)
@@ -63,8 +69,10 @@ func (r *baselineRecorder) seed(sig *event.Signal) {
 // seedControlPlane records CP signals under the actual pod name.
 func (r *baselineRecorder) seedControlPlane(pod *corev1.Pod, sig *event.Signal) {
 	ev := event.Event{
+		Resource:  sig.Resource,
 		Namespace: sig.Namespace,
 		Reason:    sig.Reason,
+		OwnerKind: sig.OwnerKind,
 	}
 	key := correlation.IncidentKey(ev, sig.Owner, nil)
 	r.add(key, pod.Name)
@@ -77,10 +85,13 @@ func (c *Controller) buildSeenSet() {
 		return
 	}
 
-	rec := newBaselineRecorder(time.Now(), c.maxBaseline)
+	rec := newBaselineRecorder(c.nowTime(), c.maxBaseline)
 
 	for _, pod := range pods {
 		c.emitBaseline(rec, pod)
+		if sig := handler.DetectPodDeletionIssue(pod, c.nowTime()); sig != nil {
+			rec.seed(sig)
+		}
 	}
 
 	c.seedNodeBaseline(rec)
@@ -117,7 +128,7 @@ func (c *Controller) emitBaseline(rec *baselineRecorder, pod *corev1.Pod) {
 		if reason == "" {
 			continue
 		}
-		ev := event.Event{Namespace: pod.Namespace, Reason: reason, ContainerName: cs.Name}
+		ev := event.Event{Namespace: pod.Namespace, PodName: pod.Name, PodUID: string(pod.UID), PodLineageID: pod.Annotations[event.PodLineageAnnotation], PodGenerateName: pod.GenerateName, Reason: reason, ContainerName: cs.Name}
 		key := correlation.IncidentKey(ev, owner, &model.ContainerState{RestartCount: cs.RestartCount})
 		rec.add(key, pod.Name)
 		hadContainerIssue = true
@@ -126,7 +137,7 @@ func (c *Controller) emitBaseline(rec *baselineRecorder, pod *corev1.Pod) {
 	if !hadContainerIssue {
 		for _, cond := range pod.Status.Conditions {
 			if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse {
-				ev := event.Event{Namespace: pod.Namespace, Reason: cond.Reason, ContainerName: "."}
+				ev := event.Event{Namespace: pod.Namespace, PodName: pod.Name, PodUID: string(pod.UID), PodLineageID: pod.Annotations[event.PodLineageAnnotation], PodGenerateName: pod.GenerateName, Reason: cond.Reason, ContainerName: "."}
 				key := correlation.IncidentKey(ev, owner, nil)
 				rec.add(key, pod.Name)
 				break
@@ -180,6 +191,9 @@ func (c *Controller) seedNodeBaseline(rec *baselineRecorder) {
 						rec.add(key, n.Name)
 						hasIssue = true
 					}
+				}
+				if sig := handler.DetectNodeDeletionIssue(n, c.nowTime()); sig != nil {
+					rec.seed(sig)
 				}
 				if hasIssue {
 					activeNodeIncidents = append(activeNodeIncidents, n.Name)

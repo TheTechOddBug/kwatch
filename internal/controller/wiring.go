@@ -1,13 +1,18 @@
 package controller
 
 import (
+	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/abahmed/kwatch/internal/config"
+	kwcontext "github.com/abahmed/kwatch/internal/graphcontext"
 )
 
 // wireNode sets up the node informer when either monitor is enabled.
@@ -72,18 +77,85 @@ func (c *Controller) wireService(cfg *config.Config, fs factorySet) {
 		c.service.synced = append(c.service.synced, inf.HasSynced)
 	}
 
+	for _, inf := range serviceInformers {
+		inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				c.recordChange(kwcontext.ChangeCreate, "service", obj)
+				if cfg.ServiceMonitor.Enabled {
+					c.service.enqueue(obj)
+				}
+				c.enqueueServiceDependents(obj)
+			},
+			UpdateFunc: func(old, obj interface{}) {
+				c.recordChangeUpdate("service", old, obj)
+				if cfg.ServiceMonitor.Enabled {
+					c.service.enqueue(obj)
+				}
+				c.enqueueServiceDependents(obj)
+			},
+			DeleteFunc: func(obj interface{}) {
+				c.recordChange(kwcontext.ChangeDelete, "service", obj)
+				if cfg.ServiceMonitor.Enabled {
+					c.service.enqueue(obj)
+				}
+				c.enqueueServiceDependents(obj)
+			},
+		})
+	}
 	if !cfg.ServiceMonitor.Enabled {
 		return
 	}
 	c.endpointSliceLister = fs.endpointSliceLister()
-
-	for _, inf := range serviceInformers {
-		inf.AddEventHandler(
-			c.changeRecordingHandler(c.service.trackResource(), c.service.enqueue),
-		)
-	}
 	c.service.startWorkers = true
 	c.watch(c.endpointSlice, fs.endpointSliceInformers()...)
+}
+
+// enqueueServiceDependents rechecks objects whose detector reads the Service
+// lister. A Service change can resolve an Ingress or admission-webhook issue
+// without changing the referencing object itself.
+func (c *Controller) enqueueServiceDependents(obj interface{}) {
+	if c.ingress.startWorkers && c.graph != nil {
+		if service, ok := obj.(*corev1.Service); ok {
+			keys := c.graph.DependentsByType("service", service.Namespace, service.Name, "ingress")
+			for _, key := range keys {
+				c.ingress.enqueue(strings.TrimPrefix(key, "ingress/"))
+			}
+			// The graph is an optimization, not the source of truth. It can be
+			// briefly stale while an Ingress and Service are updated together;
+			// always recheck the lister-backed Ingress set so a real dependency
+			// cannot be missed.
+			c.enqueueAllIngresses()
+		} else {
+			c.enqueueAllIngresses()
+		}
+	} else if c.ingress.startWorkers && c.ingressLister != nil {
+		c.enqueueAllIngresses()
+	}
+	if c.mwc.startWorkers && c.mwcLister != nil {
+		if items, err := c.mwcLister.List(labels.Everything()); err == nil {
+			for _, item := range items {
+				c.mwc.enqueue(item)
+			}
+		}
+	}
+	if c.vwc.startWorkers && c.vwcLister != nil {
+		if items, err := c.vwcLister.List(labels.Everything()); err == nil {
+			for _, item := range items {
+				c.vwc.enqueue(item)
+			}
+		}
+	}
+}
+
+func (c *Controller) enqueueAllIngresses() {
+	if c.ingressLister == nil {
+		return
+	}
+	if items, err := c.ingressLister.Ingresses(metav1.NamespaceAll).List(labels.Everything()); err == nil {
+		for _, item := range items {
+			c.ingress.enqueue(item)
+		}
+	}
 }
 
 func (c *Controller) wireAdmissionWebhooks(cfg *config.Config, fs factorySet) {
@@ -116,16 +188,37 @@ func (c *Controller) wireNetpol(cfg *config.Config, fs factorySet) {
 	c.watch(c.netpol, fs.netpolInformers()...)
 }
 
+func (c *Controller) wireClusterResources(cfg *config.Config, fs factorySet) {
+	if !cfg.ClusterResourceMonitor.Enabled {
+		return
+	}
+	c.resourceQuotaLister = fs.resourceQuotaLister()
+	c.watch(c.resourceQuota, fs.resourceQuotaInformers()...)
+	c.limitRangeLister = fs.limitRangeLister()
+	c.watch(c.limitRange, fs.limitRangeInformers()...)
+
+	c.namespaceLister = fs.namespaceLister()
+	if inf := fs.namespaceInformer(); inf != nil {
+		c.watch(c.namespace, inf)
+	}
+	c.leaseLister = fs.leaseLister()
+	c.watch(c.lease, fs.leaseInformers()...)
+}
+
 // wireControlPlane wires the kube-system pod informer and returns the dedicated
 // factory it owns.
 func (c *Controller) wireControlPlane(
 	client kubernetes.Interface,
 	resync time.Duration,
 ) informers.SharedInformerFactory {
+	opts := append(
+		[]informers.SharedInformerOption{informers.WithNamespace("kube-system")},
+		informerMemoryOptions()...,
+	)
 	cpFactory := informers.NewSharedInformerFactoryWithOptions(
 		client,
 		resync,
-		informers.WithNamespace("kube-system"),
+		opts...,
 	)
 	cpPodInformer := cpFactory.Core().V1().Pods().Informer()
 
@@ -171,14 +264,18 @@ func (c *Controller) wirePDB(cfg *config.Config, fs factorySet) {
 }
 
 // wireReplicaSet wires the replicaset lister used by owner resolution.
-func (c *Controller) wireReplicaSet(fs factorySet) {
+func (c *Controller) wireReplicaSet(cfg *config.Config, fs factorySet) {
 	c.rsLister = fs.rsLister()
 
+	rsInformers := fs.rsInformers()
 	var rsSynced []cache.InformerSynced
-	for _, inf := range fs.rsInformers() {
+	for _, inf := range rsInformers {
 		rsSynced = append(rsSynced, inf.HasSynced)
 	}
 	c.rsSynced = rsSynced
+	if cfg.ClusterResourceMonitor.Enabled {
+		c.watch(c.replicaSet, rsInformers...)
+	}
 
 }
 

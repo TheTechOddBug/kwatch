@@ -12,9 +12,9 @@ import (
 	"github.com/abahmed/kwatch/internal/alert"
 	"github.com/abahmed/kwatch/internal/audit"
 	"github.com/abahmed/kwatch/internal/config"
-	kwcontext "github.com/abahmed/kwatch/internal/context"
 	"github.com/abahmed/kwatch/internal/correlation"
 	"github.com/abahmed/kwatch/internal/enricher"
+	kwcontext "github.com/abahmed/kwatch/internal/graphcontext"
 	"github.com/abahmed/kwatch/internal/insight"
 	"github.com/abahmed/kwatch/internal/metrics"
 	"github.com/abahmed/kwatch/internal/model"
@@ -46,8 +46,10 @@ func newCorrelator(
 	am *alert.AlertManager,
 	auditLogger *audit.AuditLogger,
 	graph *kwcontext.ResourceGraph,
-	baselineCh chan<- map[string]map[string]int64,
+	baselineCh chan map[string]map[string]int64,
 	insightEngine *insight.Engine,
+	feedbackStore *insight.FeedbackStore,
+	saveFeedback func(),
 ) *correlation.Engine {
 	holder := &engineHolder{}
 	opts := &engineOptions{
@@ -58,6 +60,8 @@ func newCorrelator(
 		graph:         graph,
 		baselineCh:    baselineCh,
 		insightEngine: insightEngine,
+		feedbackStore: feedbackStore,
+		saveFeedback:  saveFeedback,
 		notify:        am.NotifyIncident,
 	}
 
@@ -89,14 +93,20 @@ func newCorrelator(
 			cfg.SmartGrouping.WindowSeconds,
 		) * time.Second,
 		NamespaceFanOutThreshold: cfg.SmartGrouping.NamespaceFanOutThreshold,
-		DependenciesOf: func(inc *model.Incident) []string {
-			return insight.DependenciesFor(opts.graph, inc)
-		},
-		LifecycleHook:    lifecycleHook(opts, holder),
-		MassFailureHook:  massFailureHook(opts, holder),
-		OnBaselineChange: onBaselineChange(baselineCh),
+		DependenciesOf:           dependencyResolver(opts.graph),
+		LifecycleHook:            lifecycleHook(opts, holder),
+		MassFailureHook:          massFailureHook(opts, holder),
+		OnBaselineChange:         onBaselineChange(baselineCh),
 	})
 	return holder.engine
+}
+
+func dependencyResolver(
+	graph *kwcontext.ResourceGraph,
+) func(*model.Incident) []string {
+	return func(inc *model.Incident) []string {
+		return insight.DependenciesFor(graph, inc)
+	}
 }
 
 // engineOptions groups the inputs shared by the correlator hooks.
@@ -110,6 +120,8 @@ type engineOptions struct {
 	// insightEngine turns an incident plus the resource graph into a
 	// diagnosis: likely cause, impact, what changed recently.
 	insightEngine *insight.Engine
+	feedbackStore *insight.FeedbackStore
+	saveFeedback  func()
 	// notify is the delivery sink, injectable so the hook can be tested.
 	notify func(*model.Incident, model.IncidentAction, *insight.Insight)
 }
@@ -138,11 +150,28 @@ func lifecycleHook(
 	holder *engineHolder,
 ) func(*model.Incident, model.IncidentAction) {
 	return func(inc *model.Incident, action model.IncidentAction) {
+		var diagnosis *insight.Insight
+		if opts.insightEngine != nil {
+			pattern := inc.Reason
+			if action != model.ActionResolved {
+				diagnosis = opts.diagnose(inc, action)
+				if diagnosis != nil && diagnosis.Pattern != "" {
+					pattern = diagnosis.Pattern
+				}
+			}
+			opts.insightEngine.ObserveOutcome(inc, action, pattern)
+			if opts.saveFeedback != nil && (action == model.ActionCreate || action == model.ActionResolved) {
+				opts.saveFeedback()
+			}
+		}
 		if action != model.ActionSkip {
 			opts.auditLogger.LogIncident(inc, action)
-			opts.notify(inc, action, opts.diagnose(inc, action))
+			if diagnosis == nil && action != model.ActionResolved {
+				diagnosis = opts.diagnose(inc, action)
+			}
+			opts.notify(inc, action, diagnosis)
 		}
-		metrics.Default.ActiveIncidents.Store(
+		metrics.DefaultRegistry().ActiveIncidents.Store(
 			int64(holder.engine.ActiveCount()),
 		)
 	}
@@ -151,7 +180,7 @@ func lifecycleHook(
 // massFailureHook reports new mass failures and resolves ones that cleared.
 func massFailureHook(opts *engineOptions, holder *engineHolder) func() {
 	return func() {
-		allIncidents := holder.engine.SnapshotAll()
+		allIncidents := holder.engine.ActiveIncidents()
 		incList := make([]*model.Incident, 0, len(allIncidents))
 		for _, inc := range allIncidents {
 			incList = append(incList, inc)
@@ -179,7 +208,7 @@ func notifyNewMassFailures(
 			continue
 		}
 		klog.V(2).InfoS("mass failure detected", "message", mf.Describe())
-		now := time.Now()
+		now := holder.engine.Now()
 		inc := &model.Incident{
 			Subject: model.Subject{
 				ID:        massFailureID(incKey),
@@ -248,18 +277,26 @@ func resolveClearedMassFailures(
 
 // onBaselineChange forwards baseline snapshots to the persistent saver.
 func onBaselineChange(
-	baselineCh chan<- map[string]map[string]int64,
+	baselineCh chan map[string]map[string]int64,
 ) func(map[string]map[string]int64) {
 	return func(b map[string]map[string]int64) {
 		total := 0
 		for _, pods := range b {
 			total += len(pods)
 		}
-		metrics.Default.BaselineSize.Store(int64(total))
+		metrics.DefaultRegistry().BaselineSize.Store(int64(total))
 		select {
 		case baselineCh <- b:
 		default:
-			// Channel full: drop oldest, keep newest
+			// Channel full: drop oldest, keep newest.
+			select {
+			case <-baselineCh:
+			default:
+			}
+			select {
+			case baselineCh <- b:
+			default:
+			}
 		}
 	}
 }

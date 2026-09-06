@@ -8,10 +8,9 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/abahmed/kwatch/internal/constant"
 
 	"k8s.io/klog/v2"
 
@@ -34,17 +33,39 @@ type DeadLetterLister interface {
 	DeadLetters() interface{}
 }
 
+type TelemetryLister interface {
+	TelemetryStatus() interface{}
+}
+
+type SecurityLister interface {
+	SecurityStatus() interface{}
+}
+
+type ControlPlaneLister interface {
+	ControlPlaneStatus() interface{}
+}
+
+type InformerLister interface {
+	InformerStatus() interface{}
+}
+
 type HealthServer struct {
-	server           *http.Server
-	port             int
-	enabled          bool
-	pprof            bool
-	diagnostics      bool
-	diagnosticsToken string
-	incidentAPI      IncidentLister
-	alertManager     TestAlertSender
-	deadLetterLister DeadLetterLister
-	ready            atomic.Bool
+	server             *http.Server
+	port               int
+	enabled            bool
+	pprof              bool
+	diagnostics        bool
+	diagnosticsToken   string
+	incidentAPI        IncidentLister
+	alertManager       TestAlertSender
+	deadLetterLister   DeadLetterLister
+	telemetryLister    TelemetryLister
+	securityLister     SecurityLister
+	controlPlaneLister ControlPlaneLister
+	informerLister     InformerLister
+	ready              atomic.Bool
+	componentMu        sync.RWMutex
+	componentErrors    map[string]string
 }
 
 type HealthResponse struct {
@@ -58,6 +79,7 @@ func NewHealthServer(cfg config.HealthCheck) *HealthServer {
 		pprof:            cfg.Pprof,
 		diagnostics:      cfg.Diagnostics,
 		diagnosticsToken: cfg.DiagnosticsToken,
+		componentErrors:  make(map[string]string),
 	}
 	return h
 }
@@ -99,6 +121,22 @@ func (h *HealthServer) SetDeadLetterLister(l DeadLetterLister) {
 	h.deadLetterLister = l
 }
 
+func (h *HealthServer) SetTelemetryLister(l TelemetryLister) {
+	h.telemetryLister = l
+}
+
+func (h *HealthServer) SetSecurityLister(l SecurityLister) {
+	h.securityLister = l
+}
+
+func (h *HealthServer) SetControlPlaneLister(l ControlPlaneLister) {
+	h.controlPlaneLister = l
+}
+
+func (h *HealthServer) SetInformerLister(l InformerLister) {
+	h.informerLister = l
+}
+
 func (h *HealthServer) Start(ctx context.Context) error {
 	if !h.enabled {
 		klog.V(4).InfoS("health check is disabled")
@@ -114,8 +152,12 @@ func (h *HealthServer) Start(ctx context.Context) error {
 		mux.HandleFunc("/test-alert", h.testAlertHandler)
 		mux.HandleFunc("/deadletters", h.deadLettersHandler)
 	}
+	mux.HandleFunc("/kubelet", h.guard(h.kubeletHandler))
+	mux.HandleFunc("/security", h.guard(h.securityHandler))
+	mux.HandleFunc("/controlplane", h.guard(h.controlPlaneHandler))
+	mux.HandleFunc("/informer", h.guard(h.informerHandler))
 
-	mux.Handle("/metrics", metrics.Default.Handler())
+	mux.Handle("/metrics", metrics.DefaultRegistry().Handler())
 
 	if h.pprof {
 		mux.HandleFunc("/debug/pprof/", h.guard(pprof.Index))
@@ -150,6 +192,18 @@ func (h *HealthServer) Start(ctx context.Context) error {
 			klog.ErrorS(err, "health check server error")
 		}
 	}()
+	if ctx != nil {
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(
+				context.Background(), 10*time.Second,
+			)
+			defer cancel()
+			if err := h.Stop(shutdownCtx); err != nil {
+				klog.ErrorS(err, "health check context shutdown failed")
+			}
+		}()
+	}
 
 	return nil
 }
@@ -181,9 +235,28 @@ func (h *HealthServer) SetReady(v bool) {
 	h.ready.Store(v)
 }
 
+func (h *HealthServer) SetComponentError(name string, err error) {
+	h.componentMu.Lock()
+	defer h.componentMu.Unlock()
+	if h.componentErrors == nil {
+		h.componentErrors = make(map[string]string)
+	}
+	if err == nil {
+		delete(h.componentErrors, name)
+		return
+	}
+	h.componentErrors[name] = err.Error()
+}
+
+func (h *HealthServer) componentsHealthy() bool {
+	h.componentMu.RLock()
+	defer h.componentMu.RUnlock()
+	return len(h.componentErrors) == 0
+}
+
 func (h *HealthServer) readyzHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
-	if !h.ready.Load() {
+	if !h.ready.Load() || !h.componentsHealthy() {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		if _, err := w.Write([]byte("not ready")); err != nil {
 			klog.ErrorS(err, "health: write not-ready response")
@@ -193,88 +266,5 @@ func (h *HealthServer) readyzHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write([]byte("OK")); err != nil {
 		klog.ErrorS(err, "health: write readyz response")
-	}
-}
-
-func (h *HealthServer) incidentsHandler(w http.ResponseWriter, r *http.Request) {
-	if !h.requireDiagnosticsAuth(w, r) {
-		return
-	}
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	if h.incidentAPI == nil {
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		if _, err := w.Write([]byte("incident API not available")); err != nil {
-			klog.ErrorS(err, "health: write incident-not-available response")
-		}
-		return
-	}
-	snap := h.incidentAPI.Snapshot()
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(snap); err != nil {
-		klog.ErrorS(err, "health: encode incidents snapshot")
-	}
-}
-
-func (h *HealthServer) testAlertHandler(w http.ResponseWriter, r *http.Request) {
-	if !h.requireDiagnosticsAuth(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		if _, err := w.Write([]byte("use POST")); err != nil {
-			klog.ErrorS(err, "health: write use-POST response")
-		}
-		return
-	}
-	if h.alertManager == nil {
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		if _, err := w.Write([]byte("alert manager not available")); err != nil {
-			klog.ErrorS(err, "health: write alertman-not-available response")
-		}
-		return
-	}
-	ev := event.Event{
-		PodName:       "test-pod",
-		Namespace:     "default",
-		Reason:        constant.ReasonTestAlert,
-		Events:        "this is a test alert from kwatch",
-		IncludeEvents: true,
-		IncludeLogs:   true,
-	}
-	h.alertManager.NotifyEvent(ev)
-	w.Header().Set("Content-Type", "text/plain")
-	w.WriteHeader(http.StatusOK)
-	if _, err := w.Write([]byte("test alert sent")); err != nil {
-		klog.ErrorS(err, "health: write test-alert-sent response")
-	}
-}
-
-func (h *HealthServer) deadLettersHandler(w http.ResponseWriter, r *http.Request) {
-	if !h.requireDiagnosticsAuth(w, r) {
-		return
-	}
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	if h.deadLetterLister == nil {
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		if _, err := w.Write([]byte("dead letter lister not available")); err != nil {
-			klog.ErrorS(err, "health: write deadletter-not-available response")
-		}
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(h.deadLetterLister.DeadLetters()); err != nil {
-		klog.ErrorS(err, "health: encode dead letters")
 	}
 }

@@ -7,12 +7,64 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/abahmed/kwatch/internal/event"
 	"github.com/abahmed/kwatch/internal/k8s"
 	"github.com/abahmed/kwatch/internal/ratelimit"
 )
+
+var providerContexts = struct {
+	sync.RWMutex
+	values map[string]context.Context
+}{values: make(map[string]context.Context)}
+
+var providerContextLocks sync.Map
+
+// WithProviderContext scopes a provider context to one delivery operation.
+// The per-provider lock prevents two independent managers using the same
+// provider name from borrowing one another's context.
+func WithProviderContext(provider string, ctx context.Context, fn func()) {
+	value, _ := providerContextLocks.LoadOrStore(provider, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	providerContexts.Lock()
+	previous, hadPrevious := providerContexts.values[provider]
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	providerContexts.values[provider] = ctx
+	providerContexts.Unlock()
+	defer func() {
+		providerContexts.Lock()
+		if hadPrevious {
+			providerContexts.values[provider] = previous
+		} else {
+			delete(providerContexts.values, provider)
+		}
+		providerContexts.Unlock()
+		mu.Unlock()
+	}()
+	fn()
+}
+
+func providerContext(provider string) context.Context {
+	providerContexts.RLock()
+	ctx := providerContexts.values[provider]
+	providerContexts.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+// ProviderContext returns the delivery context currently associated with a
+// provider. SDK-backed providers use it when their client exposes a context
+// aware request method but does not accept our Request type.
+func ProviderContext(provider string) context.Context {
+	return providerContext(provider)
+}
 
 // Request is one call to a provider's HTTP API.
 //
@@ -55,7 +107,7 @@ func Send(r Request) ([]byte, error) {
 	}
 	ctx := r.Context
 	if ctx == nil {
-		ctx = context.Background()
+		ctx = providerContext(r.Provider)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, r.URL, bytes.NewReader(r.Body))
 	if err != nil {
@@ -96,7 +148,7 @@ func Send(r Request) ([]byte, error) {
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		err := fmt.Errorf(
 			"call to %s returned status code %d: %s",
-			r.Provider, resp.StatusCode, strings.TrimSpace(string(respBody)))
+			r.Provider, resp.StatusCode, responseSummary(respBody))
 		// A 4xx means the request is wrong, not that the server is busy.
 		// Retrying a bad payload three times just delays the alerts behind it.
 		if event.IsPermanentHTTPStatus(resp.StatusCode) {
@@ -106,6 +158,23 @@ func Send(r Request) ([]byte, error) {
 	}
 
 	return respBody, nil
+}
+
+func responseSummary(body []byte) string {
+	const maxSummaryBytes = 512
+	text := strings.TrimSpace(string(body))
+	lower := strings.ToLower(text)
+	for _, marker := range []string{
+		"token", "secret", "password", "api_key", "apikey", "access_token",
+	} {
+		if strings.Contains(lower, marker) {
+			return "[response body omitted because it may contain credentials]"
+		}
+	}
+	if len(text) > maxSummaryBytes {
+		return text[:maxSummaryBytes] + "…"
+	}
+	return text
 }
 
 // Post sends an HTTP POST to url with the given body, content type and extra
@@ -120,6 +189,28 @@ func Post(
 	return Send(
 		Request{
 			Provider:    provider,
+			URL:         url,
+			Body:        body,
+			ContentType: contentType,
+			Headers:     headers,
+		},
+	)
+}
+
+// PostContext is the context-aware form of Post. Providers that can receive
+// the delivery context should use this form so shutdown cancels an in-flight
+// request instead of waiting for the transport timeout.
+func PostContext(
+	ctx context.Context,
+	provider, url string,
+	body []byte,
+	contentType string,
+	headers map[string]string,
+) ([]byte, error) {
+	return Send(
+		Request{
+			Provider:    provider,
+			Context:     ctx,
 			URL:         url,
 			Body:        body,
 			ContentType: contentType,

@@ -13,6 +13,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/abahmed/kwatch/internal/config"
+	"github.com/abahmed/kwatch/internal/k8s"
 )
 
 type namespaceScope struct {
@@ -65,25 +66,48 @@ func newFactories(
 				o.FieldSelector = excluded
 			}))
 		}
+		opts = append(opts, informerMemoryOptions()...)
 		factory := informers.NewSharedInformerFactoryWithOptions(client, resync, opts...)
 		// Create a separate factory for cluster-scoped resources (Nodes,
 		// MutatingWebhookConfigurations, ValidatingWebhookConfigurations) that
 		// must NOT inherit the namespace field selector.
-		clusterFactory := informers.NewSharedInformerFactoryWithOptions(client, resync)
+		clusterFactory := informers.NewSharedInformerFactoryWithOptions(client, resync, informerMemoryOptions()...)
 		return factorySet{global: factory, clusterScoped: clusterFactory}, []informers.SharedInformerFactory{factory, clusterFactory}
 	}
 
 	if len(scope.namespaces) == 0 {
-		clusterFactory := informers.NewSharedInformerFactoryWithOptions(client, resync)
+		clusterFactory := informers.NewSharedInformerFactoryWithOptions(client, resync, informerMemoryOptions()...)
 		return factorySet{clusterScoped: clusterFactory}, []informers.SharedInformerFactory{clusterFactory}
 	}
 
 	factories := make([]informers.SharedInformerFactory, 0, len(scope.namespaces))
 	for _, ns := range scope.namespaces {
 		opts := []informers.SharedInformerOption{informers.WithNamespace(ns)}
+		opts = append(opts, informerMemoryOptions()...)
 		factories = append(factories, informers.NewSharedInformerFactoryWithOptions(client, resync, opts...))
 	}
-	return factorySet{perNamespace: factories}, factories
+	// Cluster-scoped resources must have their own factory. A namespaced
+	// factory is sufficient for cluster-scoped REST endpoints in some client-go
+	// versions, but relying on that makes multi-namespace scope silently lose
+	// namespace, PV, and storage-class watches.
+	clusterFactory := informers.NewSharedInformerFactoryWithOptions(
+		client,
+		resync,
+		informerMemoryOptions()...,
+	)
+	factories = append(factories, clusterFactory)
+	return factorySet{
+		perNamespace:  factories[:len(factories)-1],
+		clusterScoped: clusterFactory,
+	}, factories
+}
+
+// informerMemoryOptions removes server-managed field ownership metadata from
+// cached objects. kwatch only reads labels, annotations, spec and status; this
+// metadata can be large on apply-heavy clusters and is not needed for
+// detection, graphing, or notifications.
+func informerMemoryOptions() []informers.SharedInformerOption {
+	return []informers.SharedInformerOption{informers.WithTransform(k8s.TrimManagedFields)}
 }
 
 func informerExcludedNamespaces(forbidden []string) string {

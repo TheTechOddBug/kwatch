@@ -1,11 +1,10 @@
 package controller
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
-	kwcontext "github.com/abahmed/kwatch/internal/context"
+	kwcontext "github.com/abahmed/kwatch/internal/graphcontext"
 )
 
 // wireConfigMap wires the shared configmap informer used for dependency
@@ -22,13 +21,15 @@ func (c *Controller) wireConfigMap(fs factorySet) {
 				c.recordChange(kwcontext.ChangeCreate, "configmap", obj)
 			},
 			UpdateFunc: func(old, new interface{}) {
-				c.recordChange(kwcontext.ChangeUpdate, "configmap", new)
+				c.recordChangeUpdate("configmap", old, new)
 			},
 			DeleteFunc: func(obj interface{}) {
 				c.recordChange(kwcontext.ChangeDelete, "configmap", obj)
 				if c.graph != nil {
-					if cm, ok := obj.(*corev1.ConfigMap); ok {
-						c.graph.RemoveNode("configmap", cm.Namespace, cm.Name)
+					if key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj); err == nil {
+						if ns, name, splitErr := cache.SplitMetaNamespaceKey(key); splitErr == nil {
+							c.graph.RemoveNode("configmap", ns, name)
+						}
 					}
 				}
 			},
@@ -38,6 +39,7 @@ func (c *Controller) wireConfigMap(fs factorySet) {
 
 // wireGraphSupport assigns the lister extras used by the resource graph.
 func (c *Controller) wireGraphSupport(fs factorySet) {
+	c.secretLister = fs.secretLister()
 	c.pvcLister = fs.pvcLister()
 	c.pvLister = fs.persistentVolumeLister()
 	c.serviceAccountLister = fs.serviceAccountLister()
@@ -53,6 +55,27 @@ func (c *Controller) wireGraphSupport(fs factorySet) {
 	}
 	for _, inf := range fs.storageClassInformers() {
 		c.graphSynced = append(c.graphSynced, inf.HasSynced)
+	}
+	for _, inf := range fs.secretInformers() {
+		c.graphSynced = append(c.graphSynced, inf.HasSynced)
+		inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				c.recordChange(kwcontext.ChangeCreate, "secret", obj)
+			},
+			UpdateFunc: func(old, obj interface{}) {
+				c.recordChangeUpdate("secret", old, obj)
+			},
+			DeleteFunc: func(obj interface{}) {
+				c.recordChange(kwcontext.ChangeDelete, "secret", obj)
+				if c.graph != nil {
+					if key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj); err == nil {
+						if ns, name, splitErr := cache.SplitMetaNamespaceKey(key); splitErr == nil {
+							c.graph.RemoveNode("secret", ns, name)
+						}
+					}
+				}
+			},
+		})
 	}
 	// Cluster-scoped listers only exist when a global/cluster factory was
 	// created; watching multiple namespaces skips PV and storage class edges.

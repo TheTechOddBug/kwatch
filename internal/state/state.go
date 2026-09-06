@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -10,6 +11,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
+
+	"github.com/abahmed/kwatch/internal/clock"
 )
 
 const (
@@ -17,12 +20,17 @@ const (
 	baselineConfigMapName  = "kwatch-baseline"
 	incidentsConfigMapName = "kwatch-incidents"
 	pvcConfigMapName       = "kwatch-pvc"
+	changesConfigMapName   = "kwatch-changes"
+	rcaConfigMapName       = "kwatch-rca"
 	initKey                = "kwatch-init"
 	clusterIDKey           = "cluster-id"
 	versionKey             = "version"
+	stateSchemaVersionKey  = "state-schema-version"
+	currentStateSchema     = "2"
 	firstRunKey            = "first-run"
 	notifiedVersionKey     = "notified-version"
 	lastSeenKey            = "last-seen"
+	telemetryLastSentKey   = "telemetry-last-sent"
 	baselineKey            = "baseline"
 	incidentsKey           = "incidents"
 	pvcUsageKey            = "pvc-usage"
@@ -46,6 +54,9 @@ type StateManager struct {
 	baselineMgr  *RetryConfigMapManager // kwatch-baseline
 	incidentsMgr *RetryConfigMapManager // kwatch-incidents
 	pvcMgr       *RetryConfigMapManager // kwatch-pvc
+	changesMgr   *RetryConfigMapManager // kwatch-changes
+	rcaMgr       *RetryConfigMapManager // kwatch-rca
+	now          func() time.Time
 }
 
 func NewStateManager(
@@ -75,7 +86,32 @@ func NewStateManager(
 			namespace,
 			pvcConfigMapName,
 		),
+		changesMgr: NewRetryConfigMapManager(
+			client,
+			namespace,
+			changesConfigMapName,
+		),
+		rcaMgr: NewRetryConfigMapManager(
+			client,
+			namespace,
+			rcaConfigMapName,
+		),
+		now: clock.Now,
 	}
+}
+
+// SetClock injects the clock used for persisted lifecycle metadata.
+func (s *StateManager) SetClock(now func() time.Time) {
+	if now != nil {
+		s.now = now
+	}
+}
+
+func (s *StateManager) nowTime() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return clock.Now()
 }
 
 func (s *StateManager) IsFirstRun(ctx context.Context) (bool, error) {
@@ -122,6 +158,16 @@ func (s *StateManager) GetStoredVersion(ctx context.Context) string {
 		return ""
 	}
 	return cm.Data[versionKey]
+}
+
+// GetStateSchemaVersion reports the persisted state format. An empty value is
+// a legacy installation that predates explicit schema tracking.
+func (s *StateManager) GetStateSchemaVersion(ctx context.Context) string {
+	cm, err := s.client.CoreV1().ConfigMaps(s.namespace).Get(ctx, stateConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return ""
+	}
+	return cm.Data[stateSchemaVersionKey]
 }
 
 func (s *StateManager) GetNotifiedVersion(ctx context.Context) string {
@@ -184,6 +230,38 @@ func (s *StateManager) GetLastSeen(ctx context.Context) time.Time {
 	return t
 }
 
+// GetTelemetryLastSent returns the last time the adoption heartbeat was
+// successfully sent. The zero time means no heartbeat has been sent yet.
+func (s *StateManager) GetTelemetryLastSent(ctx context.Context) time.Time {
+	cm, err := s.client.CoreV1().ConfigMaps(
+		s.namespace,
+	).Get(ctx, stateConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return time.Time{}
+	}
+	raw := cm.Data[telemetryLastSentKey]
+	if raw == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		klog.V(2).InfoS("ignoring unparsable telemetry last-sent value", "value", raw)
+		return time.Time{}
+	}
+	return t
+}
+
+// SetTelemetryLastSent records the last successful adoption heartbeat.
+func (s *StateManager) SetTelemetryLastSent(ctx context.Context, t time.Time) error {
+	return s.stateMgr.UpdateWithRetry(ctx, func(cm *corev1.ConfigMap) error {
+		if cm.Data == nil {
+			cm.Data = make(map[string]string)
+		}
+		cm.Data[telemetryLastSentKey] = t.UTC().Format(time.RFC3339)
+		return nil
+	})
+}
+
 func (s *StateManager) EnsureClusterID(ctx context.Context) (string, error) {
 	clusterID, err := s.GetClusterID(ctx)
 	if err == nil && clusterID != "" {
@@ -226,6 +304,7 @@ func (s *StateManager) MarkAsInitialized(
 	}
 
 	return s.stateMgr.UpdateWithRetry(ctx, func(c *corev1.ConfigMap) error {
+		migrateStateData(c.Data)
 		if _, exists := c.Data[initKey]; !exists {
 			c.Data[initKey] = "true"
 		}
@@ -234,11 +313,33 @@ func (s *StateManager) MarkAsInitialized(
 			c.Data[clusterIDKey] = clusterID
 		}
 		if _, exists := c.Data[firstRunKey]; !exists {
-			c.Data[firstRunKey] = time.Now().UTC().Format(time.RFC3339)
+			c.Data[firstRunKey] = s.nowTime().UTC().Format(time.RFC3339)
 		}
 		c.Data[versionKey] = version
 		return nil
 	})
+}
+
+// migrateStateData is deliberately conservative: state keys are additive and
+// older installations can be upgraded by recording the current schema. A
+// future schema is preserved so an older binary never silently downgrades it.
+// Payload-specific migrations remain in their loaders (for example, the
+// incident loader handles the legacy map format).
+func migrateStateData(data map[string]string) {
+	if data == nil {
+		return
+	}
+	stored, err := strconv.Atoi(data[stateSchemaVersionKey])
+	if err != nil {
+		if data[stateSchemaVersionKey] == "" || stored < 1 {
+			data[stateSchemaVersionKey] = currentStateSchema
+		}
+		return
+	}
+	current, _ := strconv.Atoi(currentStateSchema)
+	if stored < current {
+		data[stateSchemaVersionKey] = currentStateSchema
+	}
 }
 
 // ── helpers ───────────────────────────────────────────────────
@@ -256,10 +357,11 @@ func (s *StateManager) createConfigMap(
 			Namespace: s.namespace,
 		},
 		Data: map[string]string{
-			initKey:      "true",
-			clusterIDKey: clusterID,
-			versionKey:   version,
-			firstRunKey:  time.Now().UTC().Format(time.RFC3339),
+			initKey:               "true",
+			clusterIDKey:          clusterID,
+			versionKey:            version,
+			stateSchemaVersionKey: currentStateSchema,
+			firstRunKey:           s.nowTime().UTC().Format(time.RFC3339),
 		},
 	}
 }

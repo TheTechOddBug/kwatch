@@ -2,20 +2,41 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: kwatch
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
 ---
 kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: kwatch
+  labels:
+    app.kubernetes.io/instance: kwatch
+    app.kubernetes.io/managed-by: kwatch.sh
 rules:
 - apiGroups: [""]
-  resources: ["events", "nodes", "nodes/proxy", "pods", "pods/log", "persistentvolumeclaims", "configmaps"]
+  resources: ["events", "nodes", "nodes/proxy", "pods", "pods/log", "pods/proxy", "persistentvolumeclaims", "configmaps", "secrets", "resourcequotas", "limitranges", "endpoints"]
   verbs: ["get", "watch", "list"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods"]
+  verbs: ["get", "watch", "list"]
+- nonResourceURLs: ["/readyz", "/readyz/*"]
+  verbs: ["get"]
 - apiGroups: [""]
   resources: ["namespaces"]
   verbs: ["get", "list", "watch"]
 - apiGroups: [""]
   resources: ["services"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: ["customresourcedefinitions"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["apiregistration.k8s.io"]
+  resources: ["apiservices"]
   verbs: ["get", "watch", "list"]
 - apiGroups: [""]
   resources: ["persistentvolumes", "serviceaccounts"]
@@ -27,7 +48,16 @@ rules:
   resources: ["daemonsets", "statefulsets", "deployments", "replicasets"]
   verbs: ["get", "watch", "list"]
 - apiGroups: ["admissionregistration.k8s.io"]
-  resources: ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"]
+  resources: ["mutatingwebhookconfigurations", "validatingwebhookconfigurations", "validatingadmissionpolicies", "validatingadmissionpolicybindings"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["admissionregistration.k8s.io"]
+  resources: ["mutatingadmissionpolicies", "mutatingadmissionpolicybindings"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["certificatesigningrequests", "podcertificaterequests"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["flowcontrol.apiserver.k8s.io"]
+  resources: ["flowschemas", "prioritylevelconfigurations"]
   verbs: ["get", "watch", "list"]
 - apiGroups: ["networking.k8s.io"]
   resources: ["ingresses", "networkpolicies"]
@@ -35,22 +65,29 @@ rules:
 - apiGroups: ["discovery.k8s.io"]
   resources: ["endpointslices"]
   verbs: ["get", "watch", "list"]
-# - apiGroups: ["kwatch.abahmed.dev"]
-#   resources: ["kwatchconfigs"]
-#   verbs: ["get", "watch", "list"]
-#   # uncomment if you enable crd
+- apiGroups: ["kwatch.abahmed.dev"]
+  resources: ["kwatchconfigs"]
+  verbs: ["get", "watch", "list"]
 - apiGroups: ["autoscaling"]
   resources: ["horizontalpodautoscalers"]
   verbs: ["get", "watch", "list"]
-# - apiGroups: [""]
-#   resources: ["secrets"]
-#   verbs: ["get", "list", "watch"]
-#   # uncomment if you enable tlsMonitor
 - apiGroups: ["batch"]
   resources: ["jobs", "cronjobs"]
   verbs: ["get", "watch", "list"]
 - apiGroups: ["policy"]
   resources: ["poddisruptionbudgets"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["authorization.k8s.io"]
+  resources: ["selfsubjectaccessreviews"]
+  verbs: ["create"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["volumeattachments", "csidrivers"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["snapshot.storage.k8s.io"]
+  resources: ["volumesnapshots", "volumesnapshotcontents", "volumesnapshotclasses"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["gatewayclasses", "gateways", "httproutes", "grpcroutes", "tcproutes", "tlsroutes", "referencegrants"]
   verbs: ["get", "watch", "list"]
 ---
 apiVersion: v1
@@ -58,11 +95,18 @@ kind: ServiceAccount
 metadata:
   name: kwatch
   namespace: kwatch
+  labels:
+    app.kubernetes.io/instance: kwatch
+    app.kubernetes.io/managed-by: kwatch.sh
+automountServiceAccountToken: true
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: kwatch
+  labels:
+    app.kubernetes.io/instance: kwatch
+    app.kubernetes.io/managed-by: kwatch.sh
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -77,10 +121,17 @@ apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: kwatch-configmap-manager
   namespace: kwatch
+  labels:
+    app.kubernetes.io/instance: kwatch
+    app.kubernetes.io/managed-by: kwatch.sh
 rules:
 - apiGroups: [""]
   resources: ["configmaps"]
-  verbs: ["get", "create", "update", "patch"]
+  verbs: ["create"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["kwatch-state", "kwatch-baseline", "kwatch-incidents", "kwatch-pvc", "kwatch-changes", "kwatch-rca"]
+  verbs: ["get", "update", "patch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -88,6 +139,9 @@ kind: RoleBinding
 metadata:
   name: kwatch-configmap-manager
   namespace: kwatch
+  labels:
+    app.kubernetes.io/instance: kwatch
+    app.kubernetes.io/managed-by: kwatch.sh
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -102,6 +156,9 @@ kind: Deployment
 metadata:
   name: kwatch
   namespace: kwatch
+  labels:
+    app.kubernetes.io/instance: kwatch
+    app.kubernetes.io/managed-by: kwatch.sh
 spec:
   replicas: 1
   strategy:
@@ -109,13 +166,16 @@ spec:
   selector:
     matchLabels:
       app: kwatch
+      app.kubernetes.io/instance: kwatch
   template:
     metadata:
       labels:
         app: kwatch
+        app.kubernetes.io/instance: kwatch
     spec:
       restartPolicy: Always
       serviceAccountName: kwatch
+      automountServiceAccountToken: true
       containers:
       - name: kwatch
         image: ghcr.io/abahmed/kwatch:v0.10.5
@@ -125,6 +185,11 @@ spec:
           runAsUser: 1000
           runAsGroup: 1000
           readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
         ports:
           - name: health
             containerPort: 8060
@@ -164,5 +229,6 @@ spec:
             cpu: "100m"
       volumes:
       - name: config-volume
-        configMap:
-          name: kwatch
+        secret:
+          secretName: kwatch
+          defaultMode: 0400

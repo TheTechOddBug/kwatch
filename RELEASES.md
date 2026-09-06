@@ -3,7 +3,8 @@
 This document describes how kwatch is branched and released. Releases are cut with the
 `.github/workflows/release.yml` workflow using `workflow_dispatch`. It creates the version
 tag and a GitHub Release; `.github/workflows/publish.yml` then builds and pushes the
-multi-arch container image to `ghcr.io/abahmed/kwatch`.
+multi-arch container image to `ghcr.io/abahmed/kwatch`, publishes the stable Helm
+chart, and syncs release metadata to `kwatch.dev`.
 
 ## Branch model
 
@@ -44,6 +45,7 @@ Run the **Release** workflow (Actions → Release → Run workflow) and set:
 |---|---|---|
 | `command` | yes | `rc`, `stable`, or `patch` |
 | `bump` | no | `minor` (default), `major`, or `patch`. Only used by `rc` when it opens a new series |
+| `new_series` | no | For `rc` only. Abandon an open RC series and start a new one from the latest stable |
 | `target` | no | A commit sha/ref to tag. Defaults to `main` HEAD |
 | `dry_run` | no | Compute the version and notes, then stop. Nothing is tagged or built |
 
@@ -66,6 +68,11 @@ You never need to read the logs to find out what was cut.
    | `patch` | `v0.11.1-rc.1` | a fix you want to soak before shipping |
    | `major` | `v1.0.0-rc.1` | breaking changes |
 
+If an old RC series should be abandoned before promotion, set `new_series: true`.
+Then choose the desired `bump`; `bump: major` starts `v1.0.0-rc.1` from the latest
+stable even when an older `v0.11.0-rc.*` series is still open. Use this only when
+the older series is intentionally no longer the release target.
+
 3. Creates the tag and opens a GitHub Release marked **pre-release**.
 4. Release notes compare against the **previous RC** while a series is open, so each RC
    lists only what is new since the last one. The first RC of a series compares against the
@@ -74,7 +81,8 @@ You never need to read the logs to find out what was cut.
    and the in-app upgrader does not nag RC users.
 6. Updates the **preview install block** in `README.md` (between the `rc-install` markers) to
    the new RC and pushes that commit to `main`. The chart, the chart README, and the
-   **stable** install snippets are left alone.
+   **stable** install snippets are left alone. After publishing, `publish.yml` updates
+   the preview version shown on `kwatch.dev` and deploys the site automatically.
 7. Adds a second commit — **not pushed to `main`** — that pins `deploy/deploy.yaml` to the RC
    image, and puts the tag on it. So `kubectl apply` against the RC tag installs the
    candidate, while `deploy/deploy.yaml` on `main` still points at the latest stable. See the
@@ -115,6 +123,8 @@ Run `rc` as often as needed until the candidate stabilizes.
 3. Creates the `v<X>.<Y>.<Z>` tag **on that bump commit** and opens a normal GitHub Release
    (gets `latest`). Because the tag commit carries the bumped files, the raw
    `/kwatch/vX.Y.Z/deploy/...` refs and the chart at the tag match the released version.
+4. `publish.yml` updates the stable version shown on `kwatch.dev`, clears the preview
+   version, builds the site, and triggers one Render deployment.
 
 > **Pinned-version invariant:** on `main`, the chart version, `deploy.yaml` image tag, chart
 > README, and the **stable** README install snippets always point at the latest **stable**
@@ -214,22 +224,34 @@ Three rules follow from this:
 - **New version pin? Put it inside a block.** If it belongs to the stable channel it goes in
   a `stable-install` region; if it documents the preview it goes in the `rc-install` one.
 
-## Releasing the Helm chart (manual)
+## Releasing the Helm chart
 
-The chart (`deploy/chart`) is published to the ArtifactHub **kwatch** repository. After a
-stable release, package and upload it manually — always from `main` HEAD **after** the
-`stable` workflow's version-bump commit, so `Chart.yaml` carries the released version:
+Publishing is automatic. The `publish_helm_chart` job in
+`.github/workflows/publish.yml` runs from the stable GitHub Release tag, verifies that
+`deploy/chart/Chart.yaml` has the same version, runs `helm lint`, packages the chart, and
+updates `static/charts/index.yaml` in the `abahmed/kwatch.dev` repository.
 
-```sh
-# Update the artifacthub.io/changes annotation in Chart.yaml to describe this release first
-helm lint deploy/chart
-helm package deploy/chart   # uses Chart.yaml version, e.g. kwatch-0.11.0.tgz
-# upload the resulting .tgz to the ArtifactHub kwatch repository
-```
+The following `update_website` job updates `src/data/releases.json`, builds the Docusaurus
+site, pushes the metadata commit, and sends one Render deploy hook. RC releases skip the
+Helm chart job but still update the preview version on the site. Docusaurus serves the
+generated files under `static/charts` at `https://kwatch.dev/charts`.
 
-Nothing in this repository publishes the chart. `Chart.yaml` is the source of truth for the
-version; the copy users install comes from ArtifactHub and only updates when someone runs
-the steps above.
+Two repository secrets are required in `abahmed/kwatch`:
+
+- `RELEASE_TOKEN`: a token with permission to push the protected `main` branch, create
+  tags/releases, trigger `publish.yml`, and **Contents: Read and write** access to
+  `abahmed/kwatch.dev`. It must not be replaced by the default `GITHUB_TOKEN`.
+- `RENDER_DEPLOY_HOOK_URL`: the secret Deploy Hook URL copied from the `kwatch.dev` Render
+  service settings. The workflow sends one `POST` after pushing the website metadata.
+
+Disable Render's normal **Auto-Deploy** for the `kwatch.dev` service when using this hook;
+otherwise the same website push can start two deploys.
+
+If the token is missing or cannot push to `kwatch.dev`, the chart job fails without changing
+the website repository. The container image job and GitHub Release are separate jobs, so the
+release remains inspectable and the publish workflow can be safely re-run after fixing the
+token. The final verification job fails the release workflow if the image, website sync, or
+public chart (for stable releases) is not successful.
 
 ## Upgrader notes
 

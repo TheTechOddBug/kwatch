@@ -9,6 +9,9 @@ type Config struct {
 	// App general configuration
 	App App `yaml:"app"`
 
+	// Telemetry configures the minimal adoption heartbeat.
+	Telemetry Telemetry `yaml:"telemetry"`
+
 	// Upgrader configuration
 	Upgrader Upgrader `yaml:"upgrader"`
 
@@ -31,6 +34,11 @@ type Config struct {
 
 	// Correlation configuration for incident dedup/grouping
 	Correlation Correlation `yaml:"correlation"`
+
+	// AdaptiveThresholds adds bounded grace for large workloads during partial
+	// rollouts, reducing alerts caused by normal rollout jitter.
+	AdaptiveThresholds bool              `yaml:"adaptiveThresholds"`
+	Maintenance        MaintenanceConfig `yaml:"maintenance"`
 
 	// ReportStartupBaseline if true (default), emits a single informational
 	// notification at startup summarizing pre-existing issues that are
@@ -157,6 +165,17 @@ type Config struct {
 	// NodeResourceMonitor configures node resource overcommit prediction.
 	NodeResourceMonitor NodeResourceMonitor `yaml:"nodeResourceMonitor"`
 
+	// RuntimeMetricsMonitor optionally compares usage through metrics.k8s.io.
+	// Standalone usage monitoring is provided by KubeletTelemetryMonitor.
+	RuntimeMetricsMonitor RuntimeMetricsMonitor `yaml:"runtimeMetricsMonitor"`
+
+	// ActiveProbeMonitor performs explicitly configured HTTP, TCP, and DNS
+	// checks. It is opt-in because Kubernetes cannot infer safe probe targets.
+	ActiveProbeMonitor ActiveProbeMonitor `yaml:"activeProbeMonitor"`
+
+	// KubeletTelemetryMonitor reads built-in kubelet telemetry without an agent.
+	KubeletTelemetryMonitor KubeletTelemetryMonitor `yaml:"kubeletTelemetryMonitor"`
+
 	// DaemonSetMonitor configures rollout-stuck detection for DaemonSets.
 	DaemonSetMonitor DaemonSetMonitor `yaml:"daemonSetMonitor"`
 
@@ -186,6 +205,9 @@ type Config struct {
 
 	// NetworkPolicyMonitor configures network policy issue monitoring.
 	NetworkPolicyMonitor NetworkPolicyMonitor `yaml:"networkPolicyMonitor"`
+
+	// ClusterResourceMonitor configures quota and namespace lifecycle checks.
+	ClusterResourceMonitor ClusterResourceMonitor `yaml:"clusterResourceMonitor"`
 
 	// Silences is an optional list of silence rules that suppress matching
 	// incidents.
@@ -230,25 +252,10 @@ type Config struct {
 	AuditLog AuditLogConfig `yaml:"auditLog"`
 }
 
-// KnownProviders is the canonical set of known alert provider names.
-// Both alert.Init and config validation reference this to prevent drift.
-var KnownProviders = map[string]bool{
-	"slack": true, "pagerduty": true, "discord": true, "telegram": true,
-	"teams": true, "email": true, "rocketchat": true, "mattermost": true,
-	"opsgenie": true, "matrix": true, "dingtalk": true, "feishu": true,
-	"webhook": true, "zenduty": true, "googlechat": true,
-	"gotify": true, "ntfy": true, "pushover": true, "webex": true,
-	"github": true, "line": true,
-	"gitlab": true, "gitea": true, "zapier": true, "n8n": true, "ifttt": true,
-	"teamsworkflow": true, "zulip": true, "homeassistant": true,
-	"splunk": true, "datadog": true,
-	"newrelic": true, "clickup": true, "ilert": true,
-	"incidentio": true, "incident.io": true, "squadcast": true, "signl4": true,
-	"twilio": true, "vonage": true, "plivo": true,
-	"messagebird": true, "signal": true, "sendgrid": true, "ses": true,
-	"sns": true, "jira": true, "wecom": true, "splunkoncall": true,
-	"mailgun": true, "resend": true, "goalert": true, "alerta": true,
-	"threema": true, "flock": true, "pushbullet": true, "sensugo": true,
+// Telemetry configures the minimal adoption heartbeat. It is enabled
+// for official builds by default and can be disabled by the operator.
+type Telemetry struct {
+	Enabled bool `yaml:"enabled"`
 }
 
 // Inhibition configures cross-monitor suppression rules.
@@ -302,6 +309,13 @@ type Upgrader struct {
 type CrdConfig struct {
 	// Enabled if set to true, watches KwatchConfig CRs for live config changes.
 	Enabled bool `yaml:"enabled"`
+	// FailureConditions overrides the default condition rules using entries such
+	// as "Ready=False" or "Degraded=True" for dynamically watched CRDs.
+	FailureConditions []string `yaml:"failureConditions"`
+	// GraphReferences maps dot-separated CR spec paths to Kubernetes kinds,
+	// for example "spec.serviceName=service" or
+	// "spec.backendRefs.name=service". Arrays are traversed automatically.
+	GraphReferences []string `yaml:"graphReferences"`
 }
 
 // SmartGrouping configures coalescing same-reason incidents across
@@ -323,7 +337,7 @@ type SmartGrouping struct {
 // HealthCheck config struct
 type HealthCheck struct {
 	// Enabled if set to true, it will enable health check endpoint
-	// By default, this value is false
+	// By default, this value is true.
 	Enabled bool `yaml:"enabled"`
 
 	// Port is the port to listen on for health check requests
@@ -358,7 +372,8 @@ type AlertRoute struct {
 
 // AuditLogConfig configures structured audit logging for all incidents.
 type AuditLogConfig struct {
-	// Enabled toggles audit logging. Default false.
+	// Enabled toggles audit logging. Default true; entries go to stdout unless
+	// an output file is configured.
 	Enabled bool `yaml:"enabled"`
 	// Output is the destination for audit log entries: "stdout" (default) or a
 	// file path.

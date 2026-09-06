@@ -16,12 +16,14 @@ type Report struct {
 	Summary SummarySection
 
 	// Conditionally populated
-	Identity  *IdentitySection
-	State     *StateSection
-	Diagnosis *DiagnosisSection
-	Evidence  *EvidenceSection
-	Changes   *ChangesSection
-	Runbook   string
+	Identity    *IdentitySection
+	State       *StateSection
+	Diagnosis   *DiagnosisSection
+	Evidence    *EvidenceSection
+	Changes     *ChangesSection
+	Runbook     string
+	Fingerprint string
+	Timeline    string
 
 	// Type-specific sections (populated only for relevant reasons)
 	OOM     *OOMSection
@@ -62,10 +64,13 @@ type StateSection struct {
 
 // DiagnosisSection holds diagnostic context.
 type DiagnosisSection struct {
-	Hint    string
-	Cause   string
-	Impact  string
-	Pattern string
+	Hint       string
+	Cause      string
+	Impact     string
+	Pattern    string
+	Confidence float64
+	Evidence   []string
+	NextSteps  []string
 }
 
 // EvidenceSection holds logs and events.
@@ -82,10 +87,19 @@ type ChangesSection struct {
 
 // ChangeItem is a single recent change entry.
 type ChangeItem struct {
-	Resource  string
-	Reference string
-	Type      string
-	Age       string // how long before now, e.g. "3m"; empty when unknown
+	Resource   string
+	Reference  string
+	Type       string
+	Age        string // how long before now, e.g. "3m"; empty when unknown
+	Fields     []FieldChange
+	Additional int
+}
+
+type FieldChange struct {
+	Path   string
+	Before string
+	After  string
+	Action string
 }
 
 // OOMSection holds OOM-specific diagnostics.

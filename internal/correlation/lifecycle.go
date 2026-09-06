@@ -41,6 +41,12 @@ func (e *Engine) refreshIncident(
 	if cs != nil {
 		inc.RestartCount = int(cs.RestartCount)
 	}
+	if ev.Resource == "pod" && ev.OwnerKind == "" && owner == ev.PodName {
+		// Keep the display name current when a Pod replacement continues the
+		// same explicit lineage. The correlation key is stable; the name is
+		// intentionally human-facing and may change.
+		inc.Name = ev.PodName
+	}
 	inc.Count++
 	inc.LastSeen = now
 	inc.LastUpdate = now
@@ -67,10 +73,16 @@ func (e *Engine) resolveLocked(
 	now time.Time,
 ) transition {
 	inc.State = model.StateResolved
+	// LastSeen is the end of the incident timeline. A resolve can be caused by
+	// a clean status observation or by a stale/hold-down sweep, so retaining the
+	// last failure timestamp makes the rendered resolution point misleading.
+	inc.LastSeen = now
+	inc.LastUpdate = now
 	if inc.Resource == "node" {
 		e.refreshNodeInhibition(inc.Name)
 	}
 	e.removeBaselineForIncident(key, inc)
+	delete(e.podResourceUIDs, key)
 	// Arm the cooldown so a recurrence within the window revives silently
 	// instead of producing a resolved→CREATE→resolved flip-flop.
 	e.cleanupCooldown[key] = now.Add(e.config.Window)
@@ -98,6 +110,10 @@ func (e *Engine) holdDownLocked(inc *model.Incident, now time.Time) {
 
 func (e *Engine) MarkResolved(key model.IncidentKey) {
 	e.mu.Lock()
+	if e.frozen {
+		e.mu.Unlock()
+		return
+	}
 	e.dirty = true
 	inc, ok := e.state[key]
 	if !ok || inc.State == model.StateResolved ||
@@ -124,18 +140,41 @@ func (e *Engine) MarkResolved(key model.IncidentKey) {
 }
 
 func (e *Engine) RemovePod(namespace, podName string) {
+	e.RemovePodWithUID(namespace, podName, "")
+}
+
+func (e *Engine) RemovePodWithUID(namespace, podName, podUID string) {
 	var baselineChanged bool
 
 	e.mu.Lock()
+	if e.frozen {
+		e.mu.Unlock()
+		return
+	}
 	e.dirty = true
-	for _, inc := range e.state {
+	for key, inc := range e.state {
 		if inc.Namespace != namespace {
 			continue
 		}
 		if !inc.Resources[podName] {
 			continue
 		}
+		if podUID != "" {
+			// An identified delete is allowed to remove a resource only when
+			// this incident recorded that exact UID. Unknown identity is
+			// deliberately conservative: after a restart, deleting an old
+			// tombstone must not remove a replacement from restored state.
+			if refs := e.podResourceUIDs[key]; refs == nil || refs[podName] != podUID {
+				continue
+			}
+		}
 		delete(inc.Resources, podName)
+		if refs := e.podResourceUIDs[key]; refs != nil {
+			delete(refs, podName)
+			if len(refs) == 0 {
+				delete(e.podResourceUIDs, key)
+			}
+		}
 		// Pod removal does NOT resolve incidents. During a crash loop, the
 		// ReplicaSet replaces pods continuously and each deletion would
 		// resolve the incident, then the new pod would re-create it, causing
@@ -176,6 +215,10 @@ func (e *Engine) ResolveByResource(resource, name string) {
 	resolved := false
 
 	e.mu.Lock()
+	if e.frozen {
+		e.mu.Unlock()
+		return
+	}
 	e.dirty = true
 	now := e.now()
 	for key, inc := range e.state {

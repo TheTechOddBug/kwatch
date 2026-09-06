@@ -20,10 +20,22 @@ import (
 func serve(ctx context.Context, deps *serverDeps) int {
 	var wg sync.WaitGroup
 	errCh := make(chan error, 1)
+	if deps.initialized == nil {
+		ready := make(chan struct{})
+		close(ready)
+		deps.initialized = ready
+	}
+	if deps.controllerDone == nil {
+		deps.controllerDone = make(chan struct{})
+	}
 
 	wg.Add(4)
 	if deps.tlsSweep != nil {
 		wg.Add(1)
+	}
+	optionalMonitors := []func(context.Context){deps.statusRun, deps.metricsRun, deps.probeRun, deps.kubeletRun, deps.storageRun, deps.networkRun, deps.securityRun, deps.controlPlaneRun, deps.telemetryRun}
+	for _, monitor := range optionalMonitors {
+		startOptionalMonitor(ctx, &wg, deps.initialized, monitor)
 	}
 
 	go func() {
@@ -32,6 +44,9 @@ func serve(ctx context.Context, deps *serverDeps) int {
 	}()
 	go func() {
 		defer wg.Done()
+		if !waitForInitialization(ctx, deps.initialized) {
+			return
+		}
 		deps.pvcMonitor.Start(ctx)
 	}()
 	go func() {
@@ -81,10 +96,15 @@ func serve(ctx context.Context, deps *serverDeps) int {
 		}()
 	}
 	if deps.cfg.CrdConfig.Enabled {
-		startCRDWatcher(ctx, deps)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			startCRDWatcher(ctx, deps)
+		}()
 	}
 
 	go func() {
+		defer close(deps.controllerDone)
 		deps.notifyStartup()
 
 		workers := deps.cfg.Workers
@@ -99,6 +119,37 @@ func serve(ctx context.Context, deps *serverDeps) int {
 	}()
 
 	return waitShutdown(deps, &wg, errCh)
+}
+
+func startOptionalMonitor(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	initialized <-chan struct{},
+	monitor func(context.Context),
+) {
+	if monitor == nil {
+		return
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if !waitForInitialization(ctx, initialized) {
+			return
+		}
+		monitor(ctx)
+	}()
+}
+
+func waitForInitialization(
+	ctx context.Context,
+	initialized <-chan struct{},
+) bool {
+	select {
+	case <-initialized:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // startCRDWatcher launches the CRD watcher against the cluster rest config.
@@ -125,28 +176,48 @@ func waitShutdown(
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
+	exitCode := 0
 	select {
 	case <-sigCh:
 		klog.InfoS("shutting down gracefully...")
 	case err := <-errCh:
 		if err != nil {
 			klog.ErrorS(err, "controller startup failed, shutting down")
+			exitCode = 1
 		}
 	}
 	deps.cancel()
+	controllerStopped := waitController(deps)
 
-	doneCh := make(chan struct{})
+	// Every producer should stop before the final snapshot. Keep a hard bound
+	// so a misbehaving dependency cannot prevent the process from terminating.
+	backgroundDone := make(chan struct{})
 	go func() {
 		wg.Wait()
-		close(doneCh)
+		close(backgroundDone)
 	}()
+	backgroundStopped := false
 	select {
-	case <-doneCh:
+	case <-backgroundDone:
+		backgroundStopped = true
 	case <-time.After(10 * time.Second):
 		klog.InfoS("timed out waiting for background tasks")
 	}
-	waitIncidentSaver(deps)
-	saveFinalIncidentSnapshot(deps)
+	if controllerStopped && backgroundStopped {
+		incidentStopped := waitIncidentSaver(deps)
+		feedbackStopped := waitFeedbackSaver(deps)
+		if incidentStopped && feedbackStopped {
+			saveFinalIncidentSnapshot(deps)
+		} else {
+			klog.InfoS(
+				"skipping final incident snapshot while savers are still running",
+			)
+		}
+	} else {
+		klog.InfoS(
+			"skipping final incident snapshot while workers are still running",
+		)
+	}
 
 	select {
 	case <-deps.alertManager.Done():
@@ -165,5 +236,21 @@ func waitShutdown(
 		}
 	}
 	deps.cleanup()
-	return 0
+	return exitCode
+}
+
+func waitController(deps *serverDeps) bool {
+	if deps.controllerDone == nil {
+		return true
+	}
+	// The controller owns the event workers that can still mutate the
+	// correlator. Its Run method observes the canceled context, so waiting here
+	// is required before taking the final snapshot.
+	select {
+	case <-deps.controllerDone:
+		return true
+	case <-time.After(10 * time.Second):
+		klog.InfoS("timed out waiting for controller")
+		return false
+	}
 }

@@ -1,10 +1,16 @@
 package util
 
 import (
+	"crypto/rand"
+	"math/big"
+
 	"github.com/abahmed/kwatch/internal/insight"
 	"github.com/abahmed/kwatch/internal/message"
 	"github.com/abahmed/kwatch/internal/model"
 )
+
+const randomStringAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLM" +
+	"NOPQRSTUVWXYZ0123456789"
 
 // OrDefault returns s if non-empty, otherwise returns def.
 func OrDefault(s, def string) string {
@@ -14,23 +20,38 @@ func OrDefault(s, def string) string {
 	return s
 }
 
-// Chunks splits s into slices of at most chunkSize characters.
+// RandomString returns a cryptographically random alphanumeric string.
+func RandomString(length int) string {
+	if length <= 0 {
+		return ""
+	}
+	result := make([]byte, length)
+	limit := big.NewInt(int64(len(randomStringAlphabet)))
+	for i := range result {
+		index, err := rand.Int(rand.Reader, limit)
+		if err != nil {
+			return ""
+		}
+		result[i] = randomStringAlphabet[index.Int64()]
+	}
+	return string(result)
+}
+
+// Chunks splits s into UTF-8-safe slices whose byte length is at most
+// chunkSize where possible. Provider limits are byte limits, not rune limits.
 func Chunks(s string, chunkSize int) []string {
-	if chunkSize >= len(s) {
+	if chunkSize <= 0 || chunkSize >= len(s) {
 		return []string{s}
 	}
 
 	chunks := make([]string, 0, (len(s)-1)/chunkSize+1)
-	currentLen := 0
 	currentStart := 0
 
 	for i := range s {
-		if currentLen == chunkSize {
+		if i > currentStart && i-currentStart >= chunkSize {
 			chunks = append(chunks, s[currentStart:i])
-			currentLen = 0
 			currentStart = i
 		}
-		currentLen++
 	}
 
 	chunks = append(chunks, s[currentStart:])

@@ -53,7 +53,7 @@ func NewMattermost(
 		return nil
 	}
 
-	klog.InfoS("initializing mattermost with webhook url", "webhook", webhook)
+	klog.InfoS("initializing mattermost with webhook configured")
 
 	title, _ := config["title"].(string)
 	text, _ := config["text"].(string)
@@ -84,7 +84,13 @@ func (m *Mattermost) SendMessage(msg string) error {
 
 // SendEvent sends event to the provider
 func (m *Mattermost) SendEvent(e *event.Event) error {
-	klog.V(4).InfoS("sending to mattermost event", "event", e)
+	klog.V(4).InfoS(
+		"sending to mattermost event",
+		"namespace", e.Namespace,
+		"name", e.PodName,
+		"reason", e.Reason,
+		"action", e.Action,
+	)
 
 	b, err := m.buildMessage(e, nil)
 	if err != nil {

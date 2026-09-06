@@ -6,6 +6,7 @@ import (
 	appsv1lister "k8s.io/client-go/listers/apps/v1"
 	autoscalingv2lister "k8s.io/client-go/listers/autoscaling/v2"
 	batchv1lister "k8s.io/client-go/listers/batch/v1"
+	coordinationv1lister "k8s.io/client-go/listers/coordination/v1"
 	corev1lister "k8s.io/client-go/listers/core/v1"
 	discoveryv1lister "k8s.io/client-go/listers/discovery/v1"
 	networkingv1lister "k8s.io/client-go/listers/networking/v1"
@@ -18,26 +19,32 @@ import (
 // twenty individual setters with one value keeps the Handler interface about
 // what the handler does, not how it is fed.
 type Listers struct {
-	Pod           corev1lister.PodLister
-	Node          corev1lister.NodeLister
-	Deploy        appsv1lister.DeploymentLister
-	Job           batchv1lister.JobLister
-	CronJob       batchv1lister.CronJobLister
-	RS            appsv1lister.ReplicaSetLister
-	DS            appsv1lister.DaemonSetLister
-	SS            appsv1lister.StatefulSetLister
-	PDB           policyv1lister.PodDisruptionBudgetLister
-	Event         corev1lister.EventLister
-	EventsByPod   func(namespace, pod string) ([]*corev1.Event, error)
-	HPA           autoscalingv2lister.HorizontalPodAutoscalerLister
-	MWC           admregv1lister.MutatingWebhookConfigurationLister
-	VWC           admregv1lister.ValidatingWebhookConfigurationLister
-	Service       corev1lister.ServiceLister
-	EndpointSlice discoveryv1lister.EndpointSliceLister
-	Secret        corev1lister.SecretLister
-	Netpol        networkingv1lister.NetworkPolicyLister
-	Ingress       networkingv1lister.IngressLister
-	CPPod         corev1lister.PodLister
+	Pod            corev1lister.PodLister
+	Node           corev1lister.NodeLister
+	Deploy         appsv1lister.DeploymentLister
+	Job            batchv1lister.JobLister
+	CronJob        batchv1lister.CronJobLister
+	RS             appsv1lister.ReplicaSetLister
+	DS             appsv1lister.DaemonSetLister
+	SS             appsv1lister.StatefulSetLister
+	PDB            policyv1lister.PodDisruptionBudgetLister
+	Event          corev1lister.EventLister
+	EventsByPod    func(namespace, pod string) ([]*corev1.Event, error)
+	HPA            autoscalingv2lister.HorizontalPodAutoscalerLister
+	MWC            admregv1lister.MutatingWebhookConfigurationLister
+	VWC            admregv1lister.ValidatingWebhookConfigurationLister
+	Service        corev1lister.ServiceLister
+	EndpointSlice  discoveryv1lister.EndpointSliceLister
+	ConfigMap      corev1lister.ConfigMapLister
+	Secret         corev1lister.SecretLister
+	ServiceAccount corev1lister.ServiceAccountLister
+	Netpol         networkingv1lister.NetworkPolicyLister
+	Ingress        networkingv1lister.IngressLister
+	CPPod          corev1lister.PodLister
+	ResourceQuota  corev1lister.ResourceQuotaLister
+	LimitRange     corev1lister.LimitRangeLister
+	Namespace      corev1lister.NamespaceLister
+	Lease          coordinationv1lister.LeaseLister
 }
 
 // SetListers installs the informer-backed lookups. The correlation engine gets
@@ -56,6 +63,14 @@ func (h *handler) SetListers(l Listers) {
 	}
 	if l.Service != nil {
 		h.correlator.SetServiceLister(l.Service)
+	}
+}
+
+func (h *handler) SetNamespaceScope(namespaces []string, all bool) {
+	h.namespaceScopeAll = all
+	h.namespaceScope = make(map[string]struct{}, len(namespaces))
+	for _, namespace := range namespaces {
+		h.namespaceScope[namespace] = struct{}{}
 	}
 }
 

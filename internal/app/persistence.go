@@ -6,8 +6,74 @@ import (
 
 	"k8s.io/klog/v2"
 
+	"github.com/abahmed/kwatch/internal/insight"
 	"github.com/abahmed/kwatch/internal/model"
 )
+
+type feedbackSaver interface {
+	SaveRCAFeedback(context.Context, []insight.RCARecord) error
+}
+
+func trySendFeedbackSnapshot(ch chan []insight.RCARecord, snapshot []insight.RCARecord) {
+	select {
+	case ch <- snapshot:
+	default:
+		select {
+		case <-ch:
+		default:
+		}
+		select {
+		case ch <- snapshot:
+		default:
+		}
+	}
+}
+
+// startFeedbackSaver keeps ConfigMap I/O out of the incident lifecycle hook.
+// Feedback is advisory state, so the newest coalesced snapshot is sufficient.
+func startFeedbackSaver(
+	ctx context.Context,
+	stateMgr feedbackSaver,
+	ch <-chan []insight.RCARecord,
+	done chan<- struct{},
+) {
+	defer close(done)
+	var pending []insight.RCARecord
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	save := func(timeout time.Duration) {
+		if pending == nil {
+			return
+		}
+		fctx, cancel := context.WithTimeout(context.Background(), timeout)
+		err := stateMgr.SaveRCAFeedback(fctx, pending)
+		if err != nil {
+			klog.ErrorS(err, "failed to persist RCA feedback")
+			cancel()
+			return
+		}
+		cancel()
+		pending = nil
+	}
+	for {
+		select {
+		case snapshot := <-ch:
+			pending = snapshot
+		case <-ticker.C:
+			save(5 * time.Second)
+		case <-ctx.Done():
+			for {
+				select {
+				case snapshot := <-ch:
+					pending = snapshot
+				default:
+					save(5 * time.Second)
+					return
+				}
+			}
+		}
+	}
+}
 
 // startBaselineSaver coalesces baseline writes: at most one ConfigMap write
 // every interval. The latest snapshot always wins. Use 0 for the default
@@ -110,7 +176,9 @@ func startIncidentSaver(
 				case snap := <-ch:
 					pending = snap
 				default:
-					saveIncidentSnapshot(stateMgr, pending, 5*time.Second)
+					if pending != nil {
+						saveIncidentSnapshot(stateMgr, pending, 5*time.Second)
+					}
 					return
 				}
 			}
@@ -118,14 +186,16 @@ func startIncidentSaver(
 	}
 }
 
-func waitIncidentSaver(deps *serverDeps) {
+func waitIncidentSaver(deps *serverDeps) bool {
 	if deps.incidentDone == nil {
-		return
+		return true
 	}
 	select {
 	case <-deps.incidentDone:
+		return true
 	case <-time.After(10 * time.Second):
 		klog.InfoS("timed out waiting for incident saver")
+		return false
 	}
 }
 
@@ -135,9 +205,22 @@ func saveFinalIncidentSnapshot(deps *serverDeps) {
 	}
 	saveIncidentSnapshot(
 		deps.incidentSaver,
-		deps.correlator.SnapshotPersisted(),
+		deps.correlator.FreezeAndSnapshotPersisted(),
 		5*time.Second,
 	)
+}
+
+func waitFeedbackSaver(deps *serverDeps) bool {
+	if deps.feedbackDone == nil {
+		return true
+	}
+	select {
+	case <-deps.feedbackDone:
+		return true
+	case <-time.After(10 * time.Second):
+		klog.InfoS("timed out waiting for RCA feedback saver")
+		return false
+	}
 }
 
 func saveIncidentSnapshot(

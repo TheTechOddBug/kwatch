@@ -37,10 +37,6 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 	if err := c.waitForCaches(ctx, syncFns); err != nil {
 		return err
 	}
-	if c.readyFn != nil {
-		c.readyFn()
-	}
-
 	c.buildGraph()
 	c.recordGraphSize()
 	go func() {
@@ -65,6 +61,9 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 	if c.cpPod.startWorkers {
 		c.handler.SweepControlPlane()
 	}
+	if c.readyFn != nil {
+		c.readyFn()
+	}
 
 	if c.nodeResourceCfg != nil {
 		go func(cfg *config.NodeResourceMonitor) {
@@ -76,6 +75,11 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 				Interval:   interval,
 				CpuWarning: cfg.CpuWarning, CpuCritical: cfg.CpuCritical,
 				MemWarning: cfg.MemWarning, MemCritical: cfg.MemCritical,
+				FilesystemWarningPercent:  cfg.FilesystemWarningPercent,
+				FilesystemCriticalPercent: cfg.FilesystemCriticalPercent,
+				InodeWarningPercent:       cfg.InodeWarningPercent,
+				InodeCriticalPercent:      cfg.InodeCriticalPercent,
+				Client:                    c.client,
 			}, c.nodeLister, c.podLister)
 			mon.Run(ctx, func(sig *event.Signal) {
 				c.handler.ProcessNodeResourceOvercommit(

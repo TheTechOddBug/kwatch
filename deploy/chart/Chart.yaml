@@ -33,4 +33,3 @@ annotations:
   artifacthub.io/changes: |
     - kind: fixed
       description: "Bug fixes and stability improvements — see the GitHub release notes."
-

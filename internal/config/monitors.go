@@ -1,5 +1,13 @@
 package config
 
+// MaintenanceConfig describes annotations used to silence deliberate pod
+// maintenance without disabling monitoring for the rest of the cluster.
+type MaintenanceConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	Annotation      string `yaml:"annotation"`
+	UntilAnnotation string `yaml:"untilAnnotation"`
+}
+
 type ClusterAutoscalerMonitor struct {
 	// Enabled toggles cluster-autoscaler event monitoring.
 	Enabled bool `yaml:"enabled"`
@@ -43,6 +51,16 @@ type AdmissionWebhookMonitor struct {
 type ControlPlaneMonitor struct {
 	// Enabled if set to true, it will monitor control-plane health.
 	Enabled bool `yaml:"enabled"`
+	// IntervalSeconds controls active API-server and component health probes.
+	// Zero uses 30 seconds.
+	IntervalSeconds int `yaml:"intervalSeconds"`
+	// APIServerLatencyWarningMs is the sustained latency threshold for /readyz.
+	// Zero uses 1000ms.
+	APIServerLatencyWarningMs int `yaml:"apiServerLatencyWarningMs"`
+	// FailureThreshold is the number of consecutive failures before alerting.
+	FailureThreshold int `yaml:"failureThreshold"`
+	// RecoveryThreshold is the number of consecutive successes before resolving.
+	RecoveryThreshold int `yaml:"recoveryThreshold"`
 }
 
 // IngressMonitor configures ingress backend health monitoring.
@@ -55,6 +73,19 @@ type IngressMonitor struct {
 type NetworkPolicyMonitor struct {
 	// Enabled if set to true, it will monitor network policy issues.
 	Enabled bool `yaml:"enabled"`
+}
+
+// ClusterResourceMonitor configures status checks for cluster-level resource
+// exhaustion and lifecycle failures that are not represented by Pod events.
+type ClusterResourceMonitor struct {
+	// Enabled enables ResourceQuota, LimitRange, and stuck Namespace detection.
+	Enabled bool `yaml:"enabled"`
+	// SustainedMinutes is the minimum age of a terminating Namespace before it
+	// is reported as stuck. Zero uses the built-in default.
+	SustainedMinutes int `yaml:"sustainedMinutes"`
+	// NodeLeaseStaleSeconds is how long a node lease may go without a renew
+	// time before it is reported. Zero uses 90 seconds.
+	NodeLeaseStaleSeconds int `yaml:"nodeLeaseStaleSeconds"`
 }
 
 type PvcMonitor struct {
@@ -162,6 +193,80 @@ type NodeResourceMonitor struct {
 
 	// MemCritical is the memory overcommit ratio for critical.
 	MemCritical float64 `yaml:"memCritical"`
+
+	// Filesystem and inode percentages use kubelet summary data. Zero disables
+	// the corresponding signal.
+	FilesystemWarningPercent  float64 `yaml:"filesystemWarningPercent"`
+	FilesystemCriticalPercent float64 `yaml:"filesystemCriticalPercent"`
+	InodeWarningPercent       float64 `yaml:"inodeWarningPercent"`
+	InodeCriticalPercent      float64 `yaml:"inodeCriticalPercent"`
+}
+
+// RuntimeMetricsMonitor optionally reads metrics.k8s.io when a Metrics Server
+// is available. Built-in kubelet telemetry is the standalone default.
+type RuntimeMetricsMonitor struct {
+	Enabled               bool `yaml:"enabled"`
+	IntervalSeconds       int  `yaml:"intervalSeconds"`
+	MemoryWarningPercent  int  `yaml:"memoryWarningPercent"`
+	MemoryCriticalPercent int  `yaml:"memoryCriticalPercent"`
+	CPUWarningPercent     int  `yaml:"cpuWarningPercent"`
+	CPUCriticalPercent    int  `yaml:"cpuCriticalPercent"`
+}
+
+// KubeletTelemetryMonitor reads built-in kubelet telemetry through the API
+// server proxy without requiring an agent or external monitoring product.
+type KubeletTelemetryMonitor struct {
+	Enabled                         bool    `yaml:"enabled"`
+	IntervalSeconds                 int     `yaml:"intervalSeconds"`
+	FailureThreshold                int     `yaml:"failureThreshold"`
+	RecoveryThreshold               int     `yaml:"recoveryThreshold"`
+	PersistState                    bool    `yaml:"persistState"`
+	MemoryWarningPercent            float64 `yaml:"memoryWarningPercent"`
+	MemoryCriticalPercent           float64 `yaml:"memoryCriticalPercent"`
+	EphemeralStorageWarningPercent  float64 `yaml:"ephemeralStorageWarningPercent"`
+	EphemeralStorageCriticalPercent float64 `yaml:"ephemeralStorageCriticalPercent"`
+	CPUWarningPercent               float64 `yaml:"cpuWarningPercent"`
+	CPUCriticalPercent              float64 `yaml:"cpuCriticalPercent"`
+	CPUThrottlingWarningPercent     float64 `yaml:"cpuThrottlingWarningPercent"`
+	CPUThrottlingCriticalPercent    float64 `yaml:"cpuThrottlingCriticalPercent"`
+	PSIWarningPercent               float64 `yaml:"psiWarningPercent"`
+	PSICriticalPercent              float64 `yaml:"psiCriticalPercent"`
+	NetworkErrorRateWarning         float64 `yaml:"networkErrorRateWarning"`
+	NetworkErrorRateCritical        float64 `yaml:"networkErrorRateCritical"`
+	RuntimeErrorRateWarning         float64 `yaml:"runtimeErrorRateWarning"`
+	RuntimeErrorRateCritical        float64 `yaml:"runtimeErrorRateCritical"`
+}
+
+// ActiveProbeMonitor performs checks against configured endpoints and, when
+// AutoServices is enabled, advertised Service ports from inside kwatch.
+type ActiveProbeMonitor struct {
+	Enabled           bool              `yaml:"enabled"`
+	IntervalSeconds   int               `yaml:"intervalSeconds"`
+	TimeoutSeconds    int               `yaml:"timeoutSeconds"`
+	FailureThreshold  int               `yaml:"failureThreshold"`
+	RecoveryThreshold int               `yaml:"recoveryThreshold"`
+	HTTP              []HTTPProbeTarget `yaml:"http"`
+	TCP               []TCPProbeTarget  `yaml:"tcp"`
+	DNS               []DNSProbeTarget  `yaml:"dns"`
+	AutoServices      bool              `yaml:"autoServices"`
+}
+
+type HTTPProbeTarget struct {
+	Name              string `yaml:"name"`
+	URL               string `yaml:"url"`
+	ExpectedStatus    int    `yaml:"expectedStatus"`
+	LatencyWarningMs  int    `yaml:"latencyWarningMs"`
+	LatencyCriticalMs int    `yaml:"latencyCriticalMs"`
+}
+
+type TCPProbeTarget struct {
+	Name    string `yaml:"name"`
+	Address string `yaml:"address"`
+}
+
+type DNSProbeTarget struct {
+	Name string `yaml:"name"`
+	Host string `yaml:"host"`
 }
 
 // DaemonSetMonitor configures rollout-stuck detection for DaemonSets.

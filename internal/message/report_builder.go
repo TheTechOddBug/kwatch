@@ -37,14 +37,15 @@ func (rb *ReportBuilder) Build(
 	ins *insight.Insight,
 ) *Report {
 	r := &Report{
-		Action:    actionString(action),
-		Reason:    inc.Reason,
-		Severity:  string(inc.Severity),
-		Resource:  inc.Resource,
-		Name:      inc.Name,
-		Namespace: inc.Namespace,
-		Cluster:   rb.cluster,
-		Runbook:   inc.Runbook,
+		Action:      actionString(action),
+		Reason:      inc.Reason,
+		Severity:    string(inc.Severity),
+		Resource:    inc.Resource,
+		Name:        inc.Name,
+		Namespace:   inc.Namespace,
+		Cluster:     rb.cluster,
+		Runbook:     inc.Runbook,
+		Fingerprint: inc.Fingerprint,
 	}
 
 	r.Summary = rb.buildSummary(inc, action)
@@ -53,6 +54,7 @@ func (rb *ReportBuilder) Build(
 	rb.populateDiagnosis(r, inc, ins)
 	rb.populateEvidence(r, inc)
 	rb.populateChanges(r, ins)
+	r.Timeline = rb.buildTimeline(inc, ins, action)
 	rb.populateSuppressed(r, inc)
 	rb.populateTypeSpecific(r, inc)
 
@@ -136,8 +138,11 @@ func (rb *ReportBuilder) populateDiagnosis(
 	}
 	if ins != nil {
 		d.Cause = ins.Cause
-		d.Impact = ins.Impact
 		d.Pattern = ins.Pattern
+		d.NextSteps = append([]string(nil), ins.NextSteps...)
+		d.Impact = ins.Impact
+		d.Confidence = ins.Confidence
+		d.Evidence = append([]string(nil), ins.Evidence...)
 	}
 	// Topology the correlation engine resolved from live Service selectors.
 	// It is impact, and belongs with the rest of the impact.
@@ -241,11 +246,15 @@ func (rb *ReportBuilder) populateChanges(r *Report, ins *insight.Insight) {
 			ref = c.Namespace + "/" + c.Name
 		}
 		items = append(items, ChangeItem{
-			Resource:  c.Resource,
-			Reference: ref,
-			Type:      fmt.Sprintf("%v", c.Type),
-			Age:       ageOf(c.Timestamp, rb.now()),
+			Resource:   c.Resource,
+			Reference:  ref,
+			Type:       fmt.Sprintf("%v", c.Type),
+			Age:        ageOf(c.Timestamp, rb.now()),
+			Additional: c.Additional,
 		})
+		for _, field := range c.Fields {
+			items[len(items)-1].Fields = append(items[len(items)-1].Fields, FieldChange{Path: field.Path, Before: field.Before, After: field.After, Action: field.Action})
+		}
 	}
 
 	if len(items) > 0 {

@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"strings"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog/v2"
 
-	kwcontext "github.com/abahmed/kwatch/internal/context"
+	kwcontext "github.com/abahmed/kwatch/internal/graphcontext"
+	"github.com/abahmed/kwatch/internal/metrics"
 )
 
 func (c *Controller) addPodToGraph(pod *corev1.Pod) {
@@ -31,20 +33,17 @@ func (c *Controller) addPodToGraphChecked(pod *corev1.Pod) error {
 	if pod.Spec.ServiceAccountName != "" {
 		c.graph.AddEdge("pod", ns, name, "serviceaccount", ns, pod.Spec.ServiceAccountName, "uses_sa")
 	}
+	for _, secret := range pod.Spec.ImagePullSecrets {
+		if secret.Name != "" {
+			c.graph.AddEdge("pod", ns, name, "secret", ns, secret.Name, graphEdgeUsesPull)
+		}
+	}
 	for _, ref := range pod.OwnerReferences {
 		ownerKind := strings.ToLower(ref.Kind)
 		c.graph.AddEdge("pod", ns, name, ownerKind, ns, ref.Name, "owned_by")
 	}
 	for _, vol := range pod.Spec.Volumes {
-		if cm := vol.ConfigMap; cm != nil {
-			c.graph.AddEdge("pod", ns, name, "configmap", ns, cm.Name, "mounts")
-		}
-		if s := vol.Secret; s != nil {
-			c.graph.AddEdge("pod", ns, name, "secret", ns, s.SecretName, "mounts")
-		}
-		if pvc := vol.PersistentVolumeClaim; pvc != nil {
-			c.graph.AddEdge("pod", ns, name, "pvc", ns, pvc.ClaimName, "mounts")
-		}
+		c.addPodVolumeToGraph(ns, name, vol)
 	}
 	for _, ctr := range pod.Spec.Containers {
 		c.addContainerEnvToGraph(ns, name, ctr)
@@ -71,11 +70,76 @@ func (c *Controller) addPodToGraphChecked(pod *corev1.Pod) error {
 	return nil
 }
 
-func (c *Controller) removePodFromGraph(pod *corev1.Pod) {
+func (c *Controller) addPodVolumeToGraph(ns, podName string, vol corev1.Volume) {
+	if cm := vol.ConfigMap; cm != nil {
+		c.graph.AddEdge("pod", ns, podName, "configmap", ns, cm.Name, "mounts")
+	}
+	if secret := vol.Secret; secret != nil {
+		c.graph.AddEdge("pod", ns, podName, "secret", ns, secret.SecretName, "mounts")
+	}
+	if pvc := vol.PersistentVolumeClaim; pvc != nil {
+		c.graph.AddEdge("pod", ns, podName, "pvc", ns, pvc.ClaimName, "mounts")
+	}
+	if projected := vol.Projected; projected != nil {
+		for _, source := range projected.Sources {
+			if source.ConfigMap != nil {
+				c.graph.AddEdge("pod", ns, podName, "configmap", ns, source.ConfigMap.Name, graphEdgeProjects)
+			}
+			if source.Secret != nil {
+				c.graph.AddEdge("pod", ns, podName, "secret", ns, source.Secret.Name, graphEdgeProjects)
+			}
+		}
+	}
+	if csi := vol.CSI; csi != nil && csi.Driver != "" {
+		c.graph.AddEdge("pod", ns, podName, "csidriver", "", csi.Driver, graphEdgeUsesCSI)
+	}
+}
+
+func (c *Controller) rebuildNodeGraph(obj interface{}) {
+	node, ok := obj.(*corev1.Node)
+	if !ok || c.graph == nil {
+		return
+	}
+	c.addNodeLeaseEdge(node.Name)
+	if c.pvLister == nil {
+		return
+	}
+	pvs, err := c.pvLister.List(labels.Everything())
+	if err != nil {
+		klog.ErrorS(err, "failed to refresh persistentvolume graph edges after node change", "node", node.Name)
+		return
+	}
+	for _, pv := range pvs {
+		if err := c.rebuildPersistentVolumeChecked(pv); err != nil {
+			klog.ErrorS(err, "failed to refresh persistentvolume graph edges after node change", "node", node.Name, "pv", pv.Name)
+		}
+	}
+}
+
+func (c *Controller) addNodeLeaseEdge(nodeName string) {
+	if nodeName == "" || c.leaseLister == nil {
+		return
+	}
+	lease, err := c.leaseLister.Leases("kube-node-lease").Get(nodeName)
+	if err != nil {
+		return
+	}
+	c.graph.AddEdge("node", "", nodeName, "lease", lease.Namespace, lease.Name, "heartbeat")
+}
+
+func (c *Controller) rebuildLeaseGraph(obj interface{}) {
+	lease, ok := obj.(*coordinationv1.Lease)
+	if !ok || lease.Namespace != "kube-node-lease" || c.graph == nil {
+		return
+	}
+	c.addNodeLeaseEdge(lease.Name)
+}
+
+func (c *Controller) removePodFromGraph(namespace, name string) {
 	if c.graph == nil {
 		return
 	}
-	c.graph.RemoveNode("pod", pod.Namespace, pod.Name)
+	c.graph.RemoveNode("pod", namespace, name)
 }
 
 func (c *Controller) rebuildPodGraph(pod *corev1.Pod) {
@@ -83,8 +147,7 @@ func (c *Controller) rebuildPodGraph(pod *corev1.Pod) {
 		return
 	}
 
-	next := *c
-	next.graph = kwcontext.NewResourceGraph()
+	next := c.graphBuilder(kwcontext.NewResourceGraph())
 	if err := next.addPodToGraphChecked(pod); err != nil {
 		klog.ErrorS(err, "failed to rebuild pod graph edges; keeping previous edges", "namespace", pod.Namespace, "pod", pod.Name)
 		return
@@ -94,6 +157,37 @@ func (c *Controller) rebuildPodGraph(pod *corev1.Pod) {
 	c.graph.ReplaceMatchingEdges(func(edge kwcontext.Edge) bool {
 		return edge.From == podKey || (edge.To == podKey && edge.Type == "selects")
 	}, next.graph.Edges())
+	c.refreshPodSelectorEdges(pod.Namespace)
+}
+
+// refreshPodSelectorEdges keeps selector-based relationships accurate when a
+// pod is created or its labels change. These resources point at pods, so their
+// outgoing edges cannot be repaired by rebuilding the pod alone.
+func (c *Controller) refreshPodSelectorEdges(namespace string) {
+	if c.netpolLister != nil {
+		policies, err := c.netpolLister.NetworkPolicies(namespace).List(labels.Everything())
+		if err != nil {
+			klog.ErrorS(err, "failed to refresh networkpolicy graph edges", "namespace", namespace)
+		} else {
+			for _, policy := range policies {
+				if err := c.rebuildNetworkPolicyChecked(policy); err != nil {
+					klog.ErrorS(err, "failed to refresh networkpolicy graph edges", "namespace", policy.Namespace, "name", policy.Name)
+				}
+			}
+		}
+	}
+	if c.pdbLister != nil {
+		budgets, err := c.pdbLister.PodDisruptionBudgets(namespace).List(labels.Everything())
+		if err != nil {
+			klog.ErrorS(err, "failed to refresh poddisruptionbudget graph edges", "namespace", namespace)
+		} else {
+			for _, budget := range budgets {
+				if err := c.rebuildPodDisruptionBudgetChecked(budget); err != nil {
+					klog.ErrorS(err, "failed to refresh poddisruptionbudget graph edges", "namespace", budget.Namespace, "name", budget.Name)
+				}
+			}
+		}
+	}
 }
 
 func (c *Controller) addContainerEnvToGraph(ns, podName string, ctr corev1.Container) {
@@ -121,15 +215,35 @@ func (c *Controller) buildGraph() {
 	if c.graph == nil {
 		return
 	}
+	started := c.nowTime()
+	metrics.DefaultRegistry().GraphRebuilds.Add(1)
+	defer func() {
+		metrics.DefaultRegistry().GraphRebuildLatencyMs.Store(
+			c.nowTime().Sub(started).Milliseconds(),
+		)
+	}()
 
-	next := *c
-	next.graph = kwcontext.NewResourceGraph()
+	next := c.graphBuilder(kwcontext.NewResourceGraph())
 	if err := next.buildGraphContents(); err != nil {
 		klog.ErrorS(err, "failed to rebuild dependency graph; keeping previous graph")
 		return
 	}
 	c.graph.ReplaceWith(next.graph)
 	klog.V(4).InfoS("dependency graph built from informer cache", "edges", len(c.graph.Edges()))
+}
+
+// graphBuilder returns a lock-free controller view containing only the
+// listers required by graph construction. Copying Controller itself is unsafe
+// now that it owns synchronization state for informer diagnostics.
+func (c *Controller) graphBuilder(graph *kwcontext.ResourceGraph) *Controller {
+	return &Controller{
+		graph: graph, podLister: c.podLister, nodeLister: c.nodeLister,
+		pvcLister: c.pvcLister, pvLister: c.pvLister, rsLister: c.rsLister,
+		jobLister: c.jobLister, serviceLister: c.serviceLister,
+		ingressLister: c.ingressLister, hpaLister: c.hpaLister,
+		netpolLister: c.netpolLister, pdbLister: c.pdbLister,
+		endpointSliceLister: c.endpointSliceLister,
+	}
 }
 
 func (c *Controller) buildGraphContents() error {

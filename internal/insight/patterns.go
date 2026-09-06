@@ -5,7 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/abahmed/kwatch/internal/context"
+	"github.com/abahmed/kwatch/internal/clock"
+	context "github.com/abahmed/kwatch/internal/graphcontext"
 	"github.com/abahmed/kwatch/internal/model"
 )
 
@@ -121,7 +122,7 @@ func ScanMassFailures(
 // Describe renders the mass failure for humans, with change ages measured
 // against the wall clock.
 func (mf MassFailure) Describe() string {
-	return mf.describeAt(time.Now())
+	return mf.describeAt(clock.Now())
 }
 
 // describeAt is Describe with an explicit clock, for deterministic tests.

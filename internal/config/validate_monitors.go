@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // validateMonitors checks the per-monitor sustain/interval defaults.
@@ -66,6 +67,115 @@ func validateNodeResourceMonitor(cfg *Config) []error {
 			errors.New("nodeResourceMonitor.memCritical must be >= memWarning"),
 		)
 	}
+	for name, values := range map[string][2]float64{
+		"filesystem": {cfg.NodeResourceMonitor.FilesystemWarningPercent, cfg.NodeResourceMonitor.FilesystemCriticalPercent},
+		"inode":      {cfg.NodeResourceMonitor.InodeWarningPercent, cfg.NodeResourceMonitor.InodeCriticalPercent},
+	} {
+		warning, critical := values[0], values[1]
+		if warning == 0 && critical == 0 {
+			continue
+		}
+		if warning <= 0 || warning > 100 || critical < warning || critical > 100 {
+			errs = append(errs, errors.New("nodeResourceMonitor."+name+" thresholds must be 0/disabled or warning <= critical <= 100"))
+		}
+	}
+	return errs
+}
+
+func validateRuntimeMetricsMonitor(cfg *Config) []error {
+	if !cfg.RuntimeMetricsMonitor.Enabled {
+		return nil
+	}
+	m := cfg.RuntimeMetricsMonitor
+	var errs []error
+	if m.IntervalSeconds <= 0 {
+		errs = append(errs, errors.New("runtimeMetricsMonitor.intervalSeconds must be > 0"))
+	}
+	if m.MemoryWarningPercent <= 0 || m.MemoryWarningPercent > 100 {
+		errs = append(errs, errors.New("runtimeMetricsMonitor.memoryWarningPercent must be in 1..100"))
+	}
+	if m.MemoryCriticalPercent < m.MemoryWarningPercent || m.MemoryCriticalPercent > 100 {
+		errs = append(errs, errors.New("runtimeMetricsMonitor.memoryCriticalPercent must be >= warning and <= 100"))
+	}
+	if m.CPUWarningPercent <= 0 || m.CPUWarningPercent > 100 {
+		errs = append(errs, errors.New("runtimeMetricsMonitor.cpuWarningPercent must be in 1..100"))
+	}
+	if m.CPUCriticalPercent < m.CPUWarningPercent || m.CPUCriticalPercent > 100 {
+		errs = append(errs, errors.New("runtimeMetricsMonitor.cpuCriticalPercent must be >= warning and <= 100"))
+	}
+	return errs
+}
+
+func validateActiveProbeMonitor(cfg *Config) []error {
+	if !cfg.ActiveProbeMonitor.Enabled {
+		return nil
+	}
+	m := cfg.ActiveProbeMonitor
+	var errs []error
+	if m.IntervalSeconds <= 0 {
+		errs = append(errs, errors.New("activeProbeMonitor.intervalSeconds must be > 0"))
+	}
+	if m.TimeoutSeconds <= 0 {
+		errs = append(errs, errors.New("activeProbeMonitor.timeoutSeconds must be > 0"))
+	}
+	if m.FailureThreshold <= 0 || m.RecoveryThreshold <= 0 {
+		errs = append(errs, errors.New("activeProbeMonitor thresholds must be > 0"))
+	}
+	for _, target := range m.HTTP {
+		errs = append(errs, validateHTTPProbeTarget(target)...)
+	}
+	for _, target := range m.TCP {
+		if target.Name == "" || target.Address == "" {
+			errs = append(errs, errors.New("activeProbeMonitor.tcp targets require name and address"))
+		}
+	}
+	for _, target := range m.DNS {
+		if target.Name == "" || target.Host == "" {
+			errs = append(errs, errors.New("activeProbeMonitor.dns targets require name and host"))
+		}
+	}
+	return errs
+}
+
+func validateHTTPProbeTarget(target HTTPProbeTarget) []error {
+	var errs []error
+	if target.Name == "" || target.URL == "" {
+		errs = append(errs, errors.New("activeProbeMonitor.http targets require name and url"))
+	}
+	if target.ExpectedStatus > 0 && (target.ExpectedStatus < 100 || target.ExpectedStatus > 599) {
+		errs = append(errs, errors.New("activeProbeMonitor.http expectedStatus must be between 100 and 599"))
+	}
+	if target.LatencyWarningMs > 0 && target.LatencyCriticalMs > 0 && target.LatencyCriticalMs < target.LatencyWarningMs {
+		errs = append(errs, errors.New("activeProbeMonitor.http latencyCriticalMs must be >= latencyWarningMs"))
+	}
+	return errs
+}
+
+func validateKubeletTelemetryMonitor(cfg *Config) []error {
+	if !cfg.KubeletTelemetryMonitor.Enabled {
+		return nil
+	}
+	m := cfg.KubeletTelemetryMonitor
+	var errs []error
+	if m.IntervalSeconds <= 0 {
+		errs = append(errs, errors.New("kubeletTelemetryMonitor.intervalSeconds must be > 0"))
+	}
+	if m.FailureThreshold <= 0 || m.RecoveryThreshold <= 0 {
+		errs = append(errs, errors.New("kubeletTelemetryMonitor failure and recovery thresholds must be > 0"))
+	}
+	for name, values := range map[string][2]float64{
+		"memory":           {m.MemoryWarningPercent, m.MemoryCriticalPercent},
+		"ephemeralStorage": {m.EphemeralStorageWarningPercent, m.EphemeralStorageCriticalPercent},
+		"cpu":              {m.CPUWarningPercent, m.CPUCriticalPercent},
+		"cpuThrottling":    {m.CPUThrottlingWarningPercent, m.CPUThrottlingCriticalPercent},
+		"psi":              {m.PSIWarningPercent, m.PSICriticalPercent},
+		"networkErrorRate": {m.NetworkErrorRateWarning, m.NetworkErrorRateCritical},
+		"runtimeErrorRate": {m.RuntimeErrorRateWarning, m.RuntimeErrorRateCritical},
+	} {
+		if values[0] <= 0 || values[1] < values[0] {
+			errs = append(errs, errors.New("kubeletTelemetryMonitor."+name+" thresholds must be positive and warning <= critical"))
+		}
+	}
 	return errs
 }
 
@@ -109,6 +219,18 @@ func validateTlsMonitor(cfg *Config) []error {
 
 func validateMonitors(cfg *Config) []error {
 	var errs []error
+	for _, rule := range cfg.CrdConfig.FailureConditions {
+		parts := strings.Split(rule, "=")
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+			errs = append(errs, errors.New("crd.failureConditions entries must use ConditionType=Status"))
+		}
+	}
+	for _, rule := range cfg.CrdConfig.GraphReferences {
+		parts := strings.SplitN(rule, "=", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+			errs = append(errs, errors.New("crd.graphReferences entries must use path=kind"))
+		}
+	}
 	errs = append(errs, validateHeartbeatMonitor(cfg)...)
 	if cfg.SmartGrouping.NamespaceFanOutThreshold < 0 {
 		errs = append(
@@ -123,6 +245,9 @@ func validateMonitors(cfg *Config) []error {
 		)
 	}
 	errs = append(errs, validateNodeResourceMonitor(cfg)...)
+	errs = append(errs, validateRuntimeMetricsMonitor(cfg)...)
+	errs = append(errs, validateActiveProbeMonitor(cfg)...)
+	errs = append(errs, validateKubeletTelemetryMonitor(cfg)...)
 	errs = append(errs, validateOomMonitor(cfg)...)
 	errs = append(errs, validateTlsMonitor(cfg)...)
 	errs = append(

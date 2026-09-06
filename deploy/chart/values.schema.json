@@ -89,6 +89,36 @@
               "array"
             ],
             "default": "true"
+          },
+          "allowPrivilegeEscalation": {
+            "type": [
+              "string",
+              "boolean",
+              "number",
+              "object",
+              "array"
+            ],
+            "default": "false"
+          },
+          "capabilities": {
+            "type": "object",
+            "properties": {
+              "drop": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "seccompProfile": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "default": "RuntimeDefault"
+              }
+            }
           }
         }
       },
@@ -229,7 +259,11 @@
           "controlPlaneMonitor": {
             "type": "object",
             "properties": {
-              "enabled": { "type": "boolean" }
+              "enabled": { "type": "boolean" },
+              "intervalSeconds": { "type": "integer", "minimum": 1 },
+              "apiServerLatencyWarningMs": { "type": "integer", "minimum": 1 },
+              "failureThreshold": { "type": "integer", "minimum": 1 },
+              "recoveryThreshold": { "type": "integer", "minimum": 1 }
             }
           },
           "ingressMonitor": {
@@ -339,6 +373,7 @@
                 "containerNames": { "type": "array", "items": { "type": "string" } },
                 "logPatterns": { "type": "array", "items": { "type": "string" } },
                 "containerMessages": { "type": "array", "items": { "type": "string" } },
+                "eventMessages": { "type": "array", "items": { "type": "string" } },
                 "nodeReasons": { "type": "array", "items": { "type": "string" } },
                 "nodeMessages": { "type": "array", "items": { "type": "string" } }
               }
@@ -372,6 +407,11 @@
             }
           }
         }
+      },
+      "configSecretName": {
+        "type": "string",
+        "default": "",
+        "description": "Existing Secret containing config.yaml; avoids storing credentials in the chart ConfigMap"
       }
     }
   }

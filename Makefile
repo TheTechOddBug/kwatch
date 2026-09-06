@@ -1,7 +1,8 @@
 # Makefile for kwatch
 # Following Kubernetes community conventions
 
-.PHONY: build test test-short lint vet clean verify-fmt verify-unit verify-all docker-build docker-build-latest help
+.PHONY: build test test-short lint vet clean verify verify-fmt verify-unit \
+	verify-all verify-catalogs line-check docker-build docker-build-latest help
 
 # Binary names
 BINARY_NAME := kwatch
@@ -14,9 +15,14 @@ GOTEST := $(GOCMD) test
 GOVET := $(GOCMD) vet
 
 # Build parameters
-VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+VERSION := $(shell \
+	git describe --tags --always --dirty 2>/dev/null || echo "dev")
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS := -ldflags "-X github.com/abahmed/kwatch/internal/version.version=$(VERSION) -X github.com/abahmed/kwatch/internal/version.gitCommitID=$(shell git rev-parse --short HEAD 2>/dev/null || echo "none") -X github.com/abahmed/kwatch/internal/version.buildDate=$(BUILD_TIME)"
+LDFLAGS := -ldflags \
+	"-X github.com/abahmed/kwatch/internal/version.version=$(VERSION) \
+	-X github.com/abahmed/kwatch/internal/version.gitCommitID=$(shell \
+		git rev-parse --short HEAD 2>/dev/null || echo "none") \
+	-X github.com/abahmed/kwatch/internal/version.buildDate=$(BUILD_TIME)"
 
 # Output directory
 OUTPUT_DIR := _output
@@ -31,6 +37,9 @@ help:
 	@echo "  make test-short    Run short tests only"
 	@echo "  make vet           Run go vet"
 	@echo "  make lint          Run linting (requires golangci-lint)"
+	@echo "  make verify        Run the complete required validation gate"
+	@echo "  make verify-catalogs Verify checked-in generated catalogs"
+	@echo "  make line-check    Check new Go lines for an 80-column maximum"
 	@echo "  make verify-fmt    Verify code formatting"
 	@echo "  make verify-unit   Run unit tests"
 	@echo "  make verify-all    Run all verification scripts"
@@ -61,7 +70,10 @@ vet:
 # Run linting
 lint:
 	@echo "Running golangci-lint..."
-	@which golangci-lint > /dev/null || (echo "golangci-lint not found. Install: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest" && exit 1)
+	@command -v golangci-lint > /dev/null || { \
+		echo "golangci-lint is required; install it with go install"; \
+		exit 1; \
+	}
 	golangci-lint run ./...
 
 # Verify code formatting
@@ -80,8 +92,26 @@ verify-unit:
 	@echo "Running unit tests..."
 	$(GOTEST) -short ./...
 
-# Run all verification scripts
-verify-all: verify-fmt vet verify-unit
+# Run the repository's required validation gate. Keep this in the same order
+# as AGENTS.md so local verification and CI verification cannot drift.
+verify: build vet test lint line-check verify-catalogs
+
+verify-catalogs:
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	$(GOCMD) run ./cmd/configcatalog -output "$$tmp/config.tsv"; \
+	cmp deploy/config-catalog.tsv "$$tmp/config.tsv"; \
+	$(GOCMD) run ./cmd/featurecatalog -output "$$tmp/feature.tsv"; \
+	cmp deploy/feature-catalog.tsv "$$tmp/feature.tsv"; \
+	$(GOCMD) run ./cmd/providercatalog -output "$$tmp/provider.tsv"; \
+	cmp deploy/provider-catalog.tsv "$$tmp/provider.tsv"
+
+# Backward-compatible alias retained for contributors using the old target.
+verify-all: verify
+
+# Check new and intentionally refactored Go lines without rewriting legacy
+# generated code or unrelated provider payload literals.
+line-check:
+	@sh scripts/check-line-length.sh
 
 # Clean build artifacts
 clean:

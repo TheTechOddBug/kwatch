@@ -1,11 +1,77 @@
-# How kwatch thinks
+# 🧠 How kwatch thinks
+
+This page is for contributors and curious operators who want to understand what
+happens after Kubernetes reports a problem. For installation, start with the
+[interactive manager](./kwatch-sh.md); for settings, use the
+[configuration reference](./configuration.md).
 
 kwatch is not one of those tools that just forwards every Kubernetes event to your chat.
 Events happen constantly in a cluster — most of them are harmless. kwatch connects the dots,
 cuts the noise, and explains what broke and **why** in one plain message.
 
+### Pod identity and replacements
+
+Correlation uses a Kubernetes controller's owner UID when a Pod has an
+`OwnerReference`. For an ownerless Pod, kwatch uses the Pod UID, so a new Pod
+cannot inherit an unrelated incident. If an ownerless Pod is intentionally
+recreated as the same logical unit, put this annotation on the Pod template:
+
+```yaml
+kwatch.abahmed.dev/lineage-id: payments-worker
+```
+
+`generateName`, labels, and matching specs are evidence shown in diagnosis,
+not proof of replacement and never cause deduplication by themselves.
+
 This page explains the ideas behind those alerts in simple English. For setup and every
 option, see the [README](../README.md) and the [configuration reference](./configuration.md).
+
+## 🧩 Capability controls
+
+kwatch keeps a versioned capability catalog for `kwatch.sh`. Each capability
+has a stable ID, explicit dependencies, and a lifecycle. The catalog is
+informational; runtime behavior is controlled by each monitor's normal
+configuration (`enabled`, thresholds, and targets), which keeps startup and
+component wiring simple.
+
+## Code architecture and naming
+
+The Go code follows a one-way dependency flow:
+
+```text
+cmd/kwatch
+    └── internal/app                 composition root
+          ├── controller             informers, queues, graph wiring
+          ├── handler → filter       detection and suppression
+          ├── correlation             incident lifecycle and notifications
+          ├── insight                 cause, impact, and change analysis
+          ├── alert/*                 provider adapters and delivery
+          └── state/startup/upgrader  persistence and integrations
+```
+
+Shared leaf packages (`model`, `event`, `graphcontext`, `constant`, and
+`format`) contain data and pure helpers. They must not import orchestration,
+providers, Kubernetes clients, or application composition code. The application
+package is the only place that assembles concrete implementations and shared
+clients. Domain packages receive interfaces or injected collaborators instead
+of reaching into global state.
+
+Naming follows Go conventions and the domain vocabulary already used by the
+project:
+
+- Constructors use `New<Type>`; optional wiring uses `Set<Type>`.
+- Lifecycle methods use explicit verbs such as `Process`, `Resolve`,
+  `Snapshot`, `Start`, `Stop`, and `Validate`.
+- Files are lower-case and responsibility-oriented (`group_flush.go`,
+  `graph_resources.go`, `payload_limits_test.go`).
+- Public initialisms are consistent: `ID`, `UID`, `URL`, `HTTP`, `API`, `PVC`,
+  and `JSON`.
+- Tests use `Test<Type><Behavior>` and describe observable behavior rather than
+  implementation order.
+
+When a public name must change, keep a small compatibility wrapper and mark it
+deprecated. Remove the wrapper only after all repository imports and supported
+external call sites have migrated.
 
 ---
 

@@ -9,6 +9,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/abahmed/kwatch/internal/alert/util"
+	"github.com/abahmed/kwatch/internal/clock"
 	"github.com/abahmed/kwatch/internal/config"
 	"github.com/abahmed/kwatch/internal/event"
 	"github.com/abahmed/kwatch/internal/insight"
@@ -18,15 +19,13 @@ import (
 
 const (
 	defaultTeamsTitle = "&#9937; Kwatch detected a crash in pod"
-	defaultRetryDelay = 5
 )
 
 type Teams struct {
 	// The HTTP trigger URL for the Power Automate flow
-	webhook    string
-	title      string
-	text       string
-	retryDelay int
+	webhook string
+	title   string
+	text    string
 
 	// reference for general app configuration
 	appCfg *config.App
@@ -46,22 +45,16 @@ func NewTeams(config map[string]interface{}, appCfg *config.App) *Teams {
 		return nil
 	}
 
-	klog.InfoS("initializing Teams with flow url", "webhook", webhook)
+	klog.InfoS("initializing Teams with flow url configured")
 
 	title, _ := config["title"].(string)
 	text, _ := config["text"].(string)
 
-	retryDelay, dlOk := config["retryDelay"].(int)
-	if !dlOk || retryDelay == 0 {
-		retryDelay = defaultRetryDelay
-	}
-
 	return &Teams{
-		webhook:    webhook,
-		title:      title,
-		text:       text,
-		retryDelay: retryDelay,
-		appCfg:     appCfg,
+		webhook: webhook,
+		title:   title,
+		text:    text,
+		appCfg:  appCfg,
 	}
 }
 
@@ -209,7 +202,7 @@ func (t *Teams) buildRequestBodyTeams(e *event.Event) ([]byte, error) {
 						"type": "TextBlock",
 						"text": fmt.Sprintf(
 							"Time: %s",
-							time.Now().Format(time.RFC1123)),
+							clock.Now().Format(time.RFC1123)),
 					})
 					return body
 				}(),

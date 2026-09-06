@@ -47,8 +47,10 @@ type textRenderer struct{ m markup }
 
 func (t textRenderer) RenderCreate(r *Report) string {
 	lines := []string{t.headline(r)}
-	lines = append(lines, t.state(r))
-	lines = append(lines, t.diagnosis(r, true)...)
+	lines = append(lines, t.story(r))
+	if r.Timeline != "" {
+		lines = append(lines, "Timeline: "+r.Timeline)
+	}
 	lines = append(lines, t.changes(r))
 	lines = append(lines, t.hint(r))
 	lines = append(lines, t.meta(r))
@@ -65,12 +67,20 @@ func (t textRenderer) RenderCreate(r *Report) string {
 // have moved — state, cause, identity, fresh evidence.
 func (t textRenderer) RenderUpdate(r *Report) string {
 	lines := []string{t.headline(r)}
-	lines = append(lines, t.state(r))
-	lines = append(lines, t.diagnosis(r, false)...)
+	lines = append(lines, t.story(r))
+	if r.Timeline != "" {
+		lines = append(lines, "Timeline: "+r.Timeline)
+	}
 	lines = append(lines, t.meta(r))
 	lines = append(lines, t.typeSpecific(r)...)
 	lines = append(lines, t.evidence(r)...)
 	return joinNonEmpty(lines)
+}
+
+// story turns the structured diagnosis into a short, natural explanation.
+// It deliberately avoids exposing the internal field layout as a form.
+func (t textRenderer) story(r *Report) string {
+	return Narrative(r)
 }
 
 func (t textRenderer) RenderResolved(r *Report) string {
@@ -147,57 +157,9 @@ func (t textRenderer) headline(r *Report) string {
 	return h
 }
 
-func (t textRenderer) state(r *Report) string {
-	if r.State == nil {
-		return ""
-	}
-	return r.State.Message
-}
-
-// diagnosis: why, impact, what changed — only the lines that have content.
-func (t textRenderer) diagnosis(r *Report, full bool) []string {
-	if r.Diagnosis == nil {
-		return nil
-	}
-	var out []string
-	if r.Diagnosis.Cause != "" {
-		line := t.m.bold("Why:") + " " + r.Diagnosis.Cause
-		if r.Diagnosis.Pattern != "" {
-			line += " (" + r.Diagnosis.Pattern + ")"
-		}
-		out = append(out, line)
-	}
-	if !full {
-		return out
-	}
-	if r.Diagnosis.Impact != "" {
-		out = append(out, t.m.bold("Impact:")+" "+r.Diagnosis.Impact)
-	}
-	return out
-}
-
 // changes: what moved just before the incident, with how long before.
 func (t textRenderer) changes(r *Report) string {
-	if r.Changes == nil || len(r.Changes.Items) == 0 {
-		return ""
-	}
-	const show = 3
-	var parts []string
-	for i, c := range r.Changes.Items {
-		if i == show {
-			parts = append(
-				parts,
-				fmt.Sprintf("+%d more", len(r.Changes.Items)-show),
-			)
-			break
-		}
-		p := fmt.Sprintf("%s %s %s", c.Resource, c.Reference, c.Type)
-		if c.Age != "" {
-			p += " " + c.Age + " ago"
-		}
-		parts = append(parts, p)
-	}
-	return t.m.bold("Changed recently:") + " " + strings.Join(parts, "; ")
+	return ChangeSummary(r)
 }
 
 func (t textRenderer) hint(r *Report) string {

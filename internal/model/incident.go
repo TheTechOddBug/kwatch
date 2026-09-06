@@ -146,11 +146,14 @@ type Incident struct {
 
 // Subject identifies what an incident is about.
 type Subject struct {
-	ID        string // stable short hash for log correlation
-	Key       IncidentKey
-	Reason    string
-	Namespace string
-	Resource  string
+	ID string // stable short hash for log correlation
+	// Fingerprint is a canonical problem identity. It deliberately excludes
+	// Pod name and UID so replacements remain one incident.
+	Fingerprint string `json:"fingerprint,omitempty"`
+	Key         IncidentKey
+	Reason      string
+	Namespace   string
+	Resource    string
 	// Name identifies the subject of the incident; its encoding depends on the
 	// resource kind, so compare via ParseKey/OwnerPath rather than raw
 	// equality:
@@ -242,6 +245,7 @@ type Delivery struct {
 // stored in the kwatch-incidents ConfigMap to survive restarts.
 type PersistedIncident struct {
 	Key            IncidentKey     `json:"key"`
+	Fingerprint    string          `json:"fingerprint,omitempty"`
 	Reason         string          `json:"reason"`
 	Namespace      string          `json:"namespace"`
 	Name           string          `json:"name"`
@@ -266,8 +270,13 @@ type PersistedIncident struct {
 
 // ToPersisted converts an Incident into its serializable subset.
 func (inc *Incident) ToPersisted() PersistedIncident {
+	resources := make(map[string]bool, len(inc.Resources))
+	for k, v := range inc.Resources {
+		resources[k] = v
+	}
 	return PersistedIncident{
 		Key:            inc.Key,
+		Fingerprint:    inc.Fingerprint,
 		Reason:         inc.Reason,
 		Namespace:      inc.Namespace,
 		Name:           inc.Name,
@@ -275,7 +284,7 @@ func (inc *Incident) ToPersisted() PersistedIncident {
 		Count:          inc.Count,
 		FirstSeen:      inc.FirstSeen,
 		LastSeen:       inc.LastSeen,
-		Resources:      inc.Resources,
+		Resources:      resources,
 		PeakResources:  inc.PeakResources,
 		OwnerKind:      inc.OwnerKind,
 		RestartCount:   inc.RestartCount,
@@ -301,12 +310,13 @@ func (pi *PersistedIncident) ToIncident() *Incident {
 	}
 	return &Incident{
 		Subject: Subject{
-			Key:       pi.Key,
-			Reason:    pi.Reason,
-			Namespace: pi.Namespace,
-			Name:      pi.Name,
-			Resource:  pi.Resource,
-			OwnerKind: pi.OwnerKind,
+			Key:         pi.Key,
+			Fingerprint: pi.Fingerprint,
+			Reason:      pi.Reason,
+			Namespace:   pi.Namespace,
+			Name:        pi.Name,
+			Resource:    pi.Resource,
+			OwnerKind:   pi.OwnerKind,
 		},
 		Status: Status{
 			Count:         pi.Count,

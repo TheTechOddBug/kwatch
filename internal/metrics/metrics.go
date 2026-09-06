@@ -10,19 +10,35 @@ import (
 )
 
 type Registry struct {
-	IncidentsCreate      atomic.Int64
-	IncidentsUpdate      atomic.Int64
-	IncidentsResolved    atomic.Int64
-	IncidentsGrouped     atomic.Int64
-	NotificationsTotal   atomic.Int64
-	NotificationsDropped atomic.Int64
-	BaselineSize         atomic.Int64
-	ActiveIncidents      atomic.Int64
-	GraphNodes           atomic.Int64
-	GraphEdges           atomic.Int64
+	IncidentsCreate         atomic.Int64
+	IncidentsUpdate         atomic.Int64
+	IncidentsResolved       atomic.Int64
+	IncidentsGrouped        atomic.Int64
+	NotificationsTotal      atomic.Int64
+	NotificationsDropped    atomic.Int64
+	BaselineSize            atomic.Int64
+	ActiveIncidents         atomic.Int64
+	GraphNodes              atomic.Int64
+	GraphEdges              atomic.Int64
+	APIServerProbeErrors    atomic.Int64
+	APIServerLatencyMs      atomic.Int64
+	ControlPlaneProbeErrors atomic.Int64
+	InformerWatchErrors     atomic.Int64
+	InformerEvents          atomic.Int64
+	QueueDepth              atomic.Int64
+	ProcessingLatencyMs     atomic.Int64
+	GraphRebuilds           atomic.Int64
+	GraphRebuildLatencyMs   atomic.Int64
 }
 
+// Default is retained for compatibility with external integrations.
 var Default = &Registry{}
+
+// DefaultRegistry returns the process-wide metrics registry through the
+// package boundary used by internal components.
+func DefaultRegistry() *Registry {
+	return Default
+}
 
 func (r *Registry) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -56,6 +72,33 @@ func (r *Registry) Handler() http.Handler {
 			)
 		}
 		lines = append(lines, "")
+		lines = append(lines, "# HELP kwatch_apiserver_probe_errors_total API server health probe failures")
+		lines = append(lines, "# TYPE kwatch_apiserver_probe_errors_total counter")
+		lines = append(lines, fmt.Sprintf("kwatch_apiserver_probe_errors_total %d", r.APIServerProbeErrors.Load()))
+		lines = append(lines, "# HELP kwatch_apiserver_latency_milliseconds Latest API server readyz latency")
+		lines = append(lines, "# TYPE kwatch_apiserver_latency_milliseconds gauge")
+		lines = append(lines, fmt.Sprintf("kwatch_apiserver_latency_milliseconds %d", r.APIServerLatencyMs.Load()))
+		lines = append(lines, "# HELP kwatch_controlplane_probe_errors_total Control-plane component probe failures")
+		lines = append(lines, "# TYPE kwatch_controlplane_probe_errors_total counter")
+		lines = append(lines, fmt.Sprintf("kwatch_controlplane_probe_errors_total %d", r.ControlPlaneProbeErrors.Load()))
+		lines = append(lines, "# HELP kwatch_informer_watch_errors_total Informer watch interruptions")
+		lines = append(lines, "# TYPE kwatch_informer_watch_errors_total counter")
+		lines = append(lines, fmt.Sprintf("kwatch_informer_watch_errors_total %d", r.InformerWatchErrors.Load()))
+		lines = append(lines, "# HELP kwatch_informer_events_total Informer events received by kwatch")
+		lines = append(lines, "# TYPE kwatch_informer_events_total counter")
+		lines = append(lines, fmt.Sprintf("kwatch_informer_events_total %d", r.InformerEvents.Load()))
+		lines = append(lines, "# HELP kwatch_queue_depth Current aggregate workqueue depth")
+		lines = append(lines, "# TYPE kwatch_queue_depth gauge")
+		lines = append(lines, fmt.Sprintf("kwatch_queue_depth %d", r.QueueDepth.Load()))
+		lines = append(lines, "# HELP kwatch_processing_latency_milliseconds Latest work item processing latency")
+		lines = append(lines, "# TYPE kwatch_processing_latency_milliseconds gauge")
+		lines = append(lines, fmt.Sprintf("kwatch_processing_latency_milliseconds %d", r.ProcessingLatencyMs.Load()))
+		lines = append(lines, "# HELP kwatch_graph_rebuilds_total Dependency graph rebuild attempts")
+		lines = append(lines, "# TYPE kwatch_graph_rebuilds_total counter")
+		lines = append(lines, fmt.Sprintf("kwatch_graph_rebuilds_total %d", r.GraphRebuilds.Load()))
+		lines = append(lines, "# HELP kwatch_graph_rebuild_latency_milliseconds Latest dependency graph rebuild latency")
+		lines = append(lines, "# TYPE kwatch_graph_rebuild_latency_milliseconds gauge")
+		lines = append(lines, fmt.Sprintf("kwatch_graph_rebuild_latency_milliseconds %d", r.GraphRebuildLatencyMs.Load()))
 		lines = append(
 			lines,
 			"# HELP kwatch_notifications_total Total notification attempts",

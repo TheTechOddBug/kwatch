@@ -98,7 +98,7 @@ func DetectHPAIssues(
 		c := &hpa.Status.Conditions[i]
 		if (c.Type == autoscalingv2.AbleToScale ||
 			c.Type == autoscalingv2.ScalingActive) &&
-			c.Status == corev1.ConditionFalse {
+			(c.Status == corev1.ConditionFalse || c.Status == corev1.ConditionUnknown) {
 			if c.Reason == constant.ReasonScalingDisabled {
 				continue // target intentionally at 0 replicas — not an error
 			}
@@ -116,6 +116,15 @@ func DetectHPAIssues(
 				),
 			})
 			break
+		}
+		if c.Type == autoscalingv2.ScalingLimited &&
+			c.Status == corev1.ConditionTrue &&
+			c.Reason != constant.ReasonTooManyReplicas && c.Reason != "TooFewReplicas" {
+			out = append(out, &event.Signal{
+				Resource: "horizontalpodautoscaler", Reason: constant.ReasonHPAScalingLimited,
+				Namespace: hpa.Namespace, Owner: key, Labels: hpa.Labels,
+				Hint: fmt.Sprintf("ScalingLimited: %s — %s", c.Reason, c.Message),
+			})
 		}
 	}
 
@@ -153,12 +162,19 @@ func (h *handler) ProcessHorizontalPodAutoscalerObject(
 		)
 		return nil
 	}
+	if h.inMaintenance(hpa.Annotations) {
+		h.clearFirstMaxed(hpa.Namespace + "/" + hpa.Name)
+		h.clearFirstScalingError(hpa.Namespace + "/" + hpa.Name)
+		h.correlator.ResolveByResource("horizontalpodautoscaler", hpa.Namespace+"/"+hpa.Name)
+		return nil
+	}
 
 	key := hpa.Namespace + "/" + hpa.Name
 
 	// (1) scaling-error detection — sustained check to avoid transient noise
 	sigs := DetectHPAIssues(hpa)
 	hadError := false
+	hadLimited := false
 	for _, sig := range sigs {
 		if sig.Reason == constant.ReasonHPAScalingError {
 			first := h.markFirstScalingError(key)
@@ -169,6 +185,9 @@ func (h *handler) ProcessHorizontalPodAutoscalerObject(
 				h.signalEvent(sig)
 			}
 			hadError = true
+		} else if sig.Reason == constant.ReasonHPAScalingLimited {
+			h.signalEvent(sig)
+			hadLimited = true
 		}
 	}
 	if !hadError {
@@ -181,6 +200,11 @@ func (h *handler) ProcessHorizontalPodAutoscalerObject(
 				"",
 			),
 		)
+	}
+	if !hadLimited {
+		h.correlator.MarkResolved(correlation.BuildKey(
+			hpa.Namespace, key, constant.ReasonHPAScalingLimited, "",
+		))
 	}
 
 	// (2) maxed detection
@@ -198,9 +222,12 @@ func (h *handler) ProcessHorizontalPodAutoscalerObject(
 	}
 
 	first := h.markFirstMaxed(key)
-	sustained := time.Duration(
+	sustained := adaptiveSustained(
 		h.config.HpaMonitor.SustainedMinutes,
-	) * time.Minute
+		h.config.AdaptiveThresholds,
+		hpa.Spec.MaxReplicas,
+		hpa.Spec.MaxReplicas-hpa.Status.CurrentReplicas,
+	)
 	if sustained > 0 && h.now().Sub(first) < sustained {
 		return nil
 	}

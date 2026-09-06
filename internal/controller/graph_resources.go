@@ -9,7 +9,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/abahmed/kwatch/internal/config"
-	kwcontext "github.com/abahmed/kwatch/internal/context"
+	kwcontext "github.com/abahmed/kwatch/internal/graphcontext"
 )
 
 // Edge types added by the per-resource graph builders. Keep them in sync with
@@ -23,9 +23,15 @@ const (
 	graphEdgeBinds     = "binds"      // pvc → persistentvolume
 	graphEdgeBacks     = "backs"      // endpointslice → service
 	graphEdgeTargets   = "targets"    // endpointslice → pod
+	graphEdgeProvides  = "provides"   // service → endpointslice
+	graphEdgeUnready   = "unready"    // endpointslice → unhealthy endpoint
 	graphEdgeUsesSA    = "uses_sa"    // pod → serviceaccount
-	graphEdgeUsesSC    = "uses_sc"    // pvc → storageclass
+	graphEdgeUsesPull  = "uses_pull_secret"
+	graphEdgeProjects  = "projects"   // pod → projected config/secret
+	graphEdgeUsesCSI   = "uses_csi"   // pod → CSIDriver
+	graphEdgeUsesSC    = "uses_sc"    // pvc/persistentvolume → storageclass
 	graphEdgeLocalAt   = "local_at"   // persistentvolume → node (affinity)
+	graphEdgeTLS       = "tls_secret" // ingress → TLS secret
 )
 
 // graphHandler returns an event handler that maintains a resource's node in
@@ -127,6 +133,9 @@ func (c *Controller) buildResourceGraph() error {
 			return err
 		}
 	}
+	if err := c.buildServiceGraph(); err != nil {
+		return err
+	}
 	if c.ingressLister != nil {
 		items, err := c.ingressLister.Ingresses(metav1.NamespaceAll).List(labels.Everything())
 		if err := rebuildFrom(items, err, "list ingresses for graph build", c.rebuildIngress); err != nil {
@@ -157,13 +166,26 @@ func (c *Controller) buildResourceGraph() error {
 			return err
 		}
 	}
-	if c.pvLister != nil {
-		items, err := c.pvLister.List(labels.Everything())
-		if err := rebuildCheckedFrom(items, err, "build persistentvolume graph edges", c.rebuildPersistentVolumeChecked); err != nil {
-			return err
-		}
+	if err := c.buildPersistentVolumeGraph(); err != nil {
+		return err
 	}
 	return nil
+}
+
+func (c *Controller) buildServiceGraph() error {
+	if c.serviceLister == nil {
+		return nil
+	}
+	items, err := c.serviceLister.Services(metav1.NamespaceAll).List(labels.Everything())
+	return rebuildCheckedFrom(items, err, "build service graph edges", c.rebuildServiceChecked)
+}
+
+func (c *Controller) buildPersistentVolumeGraph() error {
+	if c.pvLister == nil {
+		return nil
+	}
+	items, err := c.pvLister.List(labels.Everything())
+	return rebuildCheckedFrom(items, err, "build persistentvolume graph edges", c.rebuildPersistentVolumeChecked)
 }
 
 // wireGraphHandlers attaches per-resource graph maintenance handlers to the
@@ -173,6 +195,12 @@ func (c *Controller) buildResourceGraph() error {
 // monitor contribute edges only while that monitor is on; pod, configmap and
 // the newly introduced PVC informer are always wired.
 func (c *Controller) wireGraphHandlers(fs factorySet, cfg *config.Config) {
+	c.wireNodeAndLeaseGraphHandlers(fs)
+	if c.serviceLister != nil {
+		for _, inf := range fs.serviceInformers() {
+			inf.AddEventHandler(c.graphHandler("service", c.rebuildService))
+		}
+	}
 	for _, inf := range fs.rsInformers() {
 		inf.AddEventHandler(c.graphHandler("replicaset", func(obj interface{}) { c.rebuildReplicaSet(obj) }))
 	}
@@ -214,6 +242,18 @@ func (c *Controller) wireGraphHandlers(fs factorySet, cfg *config.Config) {
 	if cfg.ServiceMonitor.Enabled {
 		for _, inf := range fs.endpointSliceInformers() {
 			inf.AddEventHandler(c.graphHandler("endpointslice", c.rebuildEndpointSlice))
+		}
+	}
+}
+
+func (c *Controller) wireNodeAndLeaseGraphHandlers(fs factorySet) {
+	if c.nodeLister != nil {
+		inf := fs.nodeInformer()
+		inf.AddEventHandler(c.graphHandler("node", c.rebuildNodeGraph))
+	}
+	if c.leaseLister != nil {
+		for _, inf := range fs.leaseInformers() {
+			inf.AddEventHandler(c.graphHandler("lease", c.rebuildLeaseGraph))
 		}
 	}
 }

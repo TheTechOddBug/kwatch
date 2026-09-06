@@ -10,6 +10,7 @@ import (
 	corev1lister "k8s.io/client-go/listers/core/v1"
 
 	"github.com/abahmed/kwatch/internal/audit"
+	"github.com/abahmed/kwatch/internal/clock"
 	"github.com/abahmed/kwatch/internal/constant"
 	"github.com/abahmed/kwatch/internal/enricher"
 	"github.com/abahmed/kwatch/internal/event"
@@ -56,7 +57,7 @@ func IncidentKey(
 			return GlobalKey(r, scope)
 		}
 	}
-	return BuildKey(ev.Namespace, owner, r, "")
+	return BuildKey(ev.Namespace, incidentOwner(ev, owner), r, "")
 }
 
 func notifSig(inc *model.Incident) string {
@@ -82,14 +83,14 @@ func (e *Engine) edgeAction(inc *model.Incident) model.IncidentAction {
 	inc.NotifiedSig = sig
 	inc.LastNotifiedAt = e.now()
 	if inc.State == model.StateResolved {
-		metrics.Default.IncidentsResolved.Add(1)
+		metrics.DefaultRegistry().IncidentsResolved.Add(1)
 		return model.ActionResolved
 	}
 	if prev == "" {
-		metrics.Default.IncidentsCreate.Add(1)
+		metrics.DefaultRegistry().IncidentsCreate.Add(1)
 		return model.ActionCreate
 	}
-	metrics.Default.IncidentsUpdate.Add(1)
+	metrics.DefaultRegistry().IncidentsUpdate.Add(1)
 	return model.ActionUpdate
 }
 
@@ -100,6 +101,10 @@ const DefaultMaxBaseline = 2000
 type Engine struct {
 	mu    sync.Mutex
 	state map[model.IncidentKey]*model.Incident
+	// frozen is set immediately before the final shutdown snapshot. Dynamic
+	// informer callbacks may still be unwinding after their stop channel
+	// closes, so runtime incident mutations must become no-ops at that point.
+	frozen bool
 	// ns → key → inc
 	namespaceIndex map[string]map[model.IncidentKey]*model.Incident
 	config         Config
@@ -115,7 +120,10 @@ type Engine struct {
 	activeNodeIncidents map[string]bool
 	// key: namespace/podName
 	lastContainerIndex map[string]*model.ContainerState
-	serviceLister      corev1lister.ServiceLister
+	// Incident key → concrete Pod name → UID. This protects cleanup when a
+	// replacement reuses a name before an old delete tombstone is processed.
+	podResourceUIDs map[model.IncidentKey]map[string]string
+	serviceLister   corev1lister.ServiceLister
 	// key → cooldown expiry; prevents resolve→recreate cycle
 	cleanupCooldown map[model.IncidentKey]time.Time
 	// computeGroupKey output → group buffer
@@ -160,6 +168,7 @@ func NewEngine(cfg Config) *Engine {
 		config:               cfg,
 		activeNodeIncidents:  make(map[string]bool),
 		lastContainerIndex:   make(map[string]*model.ContainerState),
+		podResourceUIDs:      make(map[model.IncidentKey]map[string]string),
 		cleanupCooldown:      make(map[model.IncidentKey]time.Time),
 		groupBuffers:         make(map[string]*pendingGroup),
 		groupResolveTrackers: make(map[string]*groupResolveTracker),
@@ -169,12 +178,28 @@ func NewEngine(cfg Config) *Engine {
 		massFailures:         make(map[model.IncidentKey]*model.Incident),
 	}
 	if e.now == nil {
-		e.now = time.Now
+		e.now = clock.Now
 	}
 	if cfg.Baseline != nil {
 		e.SetBaseline(cfg.Baseline)
 	}
 	return e
+}
+
+// SetClock injects the clock used for incident lifecycle timestamps.
+func (e *Engine) SetClock(now func() time.Time) {
+	if now != nil {
+		e.now = now
+	}
+}
+
+// Now returns the engine clock for integrations that create incidents on its
+// behalf, keeping their timestamps consistent with the lifecycle engine.
+func (e *Engine) Now() time.Time {
+	if e.now != nil {
+		return e.now()
+	}
+	return clock.Now()
 }
 
 var knownRetryReasons = map[string]bool{

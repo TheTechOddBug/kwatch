@@ -2,6 +2,7 @@ package handler
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/abahmed/kwatch/internal/constant"
 
@@ -78,12 +79,35 @@ func DetectJobIssue(job *batchv1.Job) *event.Signal {
 	return nil
 }
 
+func DetectJobExecutionIssue(job *batchv1.Job, now time.Time) *event.Signal {
+	if job == nil || job.Status.StartTime == nil {
+		return nil
+	}
+	owner := job.Namespace + "/" + job.Name
+	if job.Spec.ActiveDeadlineSeconds != nil && job.Status.Active > 0 &&
+		now.Sub(job.Status.StartTime.Time) >= time.Duration(*job.Spec.ActiveDeadlineSeconds)*time.Second {
+		return &event.Signal{Resource: "job", Namespace: job.Namespace, Owner: owner,
+			Reason: constant.ReasonJobDeadlineExceeded, Labels: job.Labels,
+			Hint: fmt.Sprintf("Job exceeded activeDeadlineSeconds=%d", *job.Spec.ActiveDeadlineSeconds)}
+	}
+	if job.Spec.BackoffLimit != nil && job.Status.Failed >= *job.Spec.BackoffLimit && job.Status.CompletionTime == nil {
+		return &event.Signal{Resource: "job", Namespace: job.Namespace, Owner: owner,
+			Reason: constant.ReasonJobBackoffLimitExceeded, Labels: job.Labels,
+			Hint: fmt.Sprintf("Job failed %d times; backoffLimit=%d", job.Status.Failed, *job.Spec.BackoffLimit)}
+	}
+	return nil
+}
+
 func (h *handler) ProcessJobObject(job *batchv1.Job, deleted bool) error {
 	if job == nil {
 		return nil
 	}
 
 	if deleted {
+		h.correlator.ResolveByResource("job", job.Namespace+"/"+job.Name)
+		return nil
+	}
+	if h.inMaintenance(job.Annotations) {
 		h.correlator.ResolveByResource("job", job.Namespace+"/"+job.Name)
 		return nil
 	}
@@ -96,6 +120,10 @@ func (h *handler) ProcessJobObject(job *batchv1.Job, deleted bool) error {
 	}
 
 	if sig := DetectJobIssue(job); sig != nil {
+		h.signalEvent(sig)
+		return nil
+	}
+	if sig := DetectJobExecutionIssue(job, h.now()); sig != nil {
 		h.signalEvent(sig)
 		return nil
 	}

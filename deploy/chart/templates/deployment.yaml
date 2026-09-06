@@ -15,7 +15,11 @@ spec:
   template:
     metadata:
       annotations:
+        {{- if .Values.configSecretName }}
+        checksum/config-secret: {{ .Values.configSecretName | sha256sum }}
+        {{- else }}
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
           {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -27,6 +31,7 @@ spec:
     spec:
       restartPolicy: Always
       serviceAccountName:  {{ .Release.Name }}
+      automountServiceAccountToken: true
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
@@ -81,5 +86,12 @@ spec:
       {{- end }}
       volumes:
         - name: config-volume
+          {{- if .Values.configSecretName }}
+          secret:
+            secretName: {{ .Values.configSecretName }}
+            defaultMode: 0400
+          {{- else }}
           configMap:
             name: {{ .Release.Name }}
+            defaultMode: 0444
+          {{- end }}

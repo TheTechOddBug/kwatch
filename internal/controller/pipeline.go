@@ -10,6 +10,9 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+
+	"github.com/abahmed/kwatch/internal/clock"
+	"github.com/abahmed/kwatch/internal/metrics"
 )
 
 // maxSyncRetries bounds how many times a failing key is requeued. With the
@@ -28,6 +31,7 @@ type resourcePipeline struct {
 	queueName    string // workqueue name exposed via metrics
 	track        string // ChangeTracker resource label, defaults to name
 	startWorkers bool
+	now          func() time.Time
 	queue        workqueue.TypedRateLimitingInterface[string]
 	synced       []cache.InformerSynced
 	syncFn       func(ctx context.Context, key string) error
@@ -37,6 +41,7 @@ func newResourcePipeline(name, queueName string) *resourcePipeline {
 	return &resourcePipeline{
 		name:      name,
 		queueName: queueName,
+		now:       clock.Now,
 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 			workqueue.TypedRateLimitingQueueConfig[string]{Name: queueName},
@@ -66,6 +71,14 @@ func (p *resourcePipeline) processNextItem(ctx context.Context) bool {
 		return false
 	}
 	defer p.queue.Done(key)
+	started := p.nowTime()
+	defer func() {
+		metrics.DefaultRegistry().ProcessingLatencyMs.Store(
+			p.nowTime().Sub(started).Milliseconds(),
+		)
+		metrics.DefaultRegistry().QueueDepth.Store(int64(p.queue.Len()))
+	}()
+	metrics.DefaultRegistry().QueueDepth.Store(int64(p.queue.Len()))
 	if err := p.syncFn(ctx, key); err != nil {
 		// Retry transient errors with backoff first. A still-failing resource
 		// then moves to a slow recovery cadence, while permanent errors are
@@ -97,6 +110,13 @@ func (p *resourcePipeline) processNextItem(ctx context.Context) bool {
 
 	p.queue.Forget(key)
 	return true
+}
+
+func (p *resourcePipeline) nowTime() time.Time {
+	if p.now != nil {
+		return p.now()
+	}
+	return clock.Now()
 }
 
 func shouldRetrySyncError(ctx context.Context, err error) bool {

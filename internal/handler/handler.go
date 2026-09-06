@@ -23,6 +23,7 @@ type Handler interface {
 	ProcessPod(ctx context.Context, key string, deleted bool) error
 	ProcessNode(key string, deleted bool) error
 	ProcessDeployment(key string, deleted bool) error
+	ProcessReplicaSet(key string, deleted bool) error
 	ProcessJob(key string, deleted bool) error
 	ProcessDaemonSet(key string, deleted bool) error
 	ProcessCronJob(key string, deleted bool) error
@@ -34,12 +35,17 @@ type Handler interface {
 	ProcessService(key string, deleted bool) error
 	ProcessNetworkPolicy(key string, deleted bool) error
 	ProcessIngress(key string, deleted bool) error
+	ProcessResourceQuota(key string, deleted bool) error
+	ProcessLimitRange(key string, deleted bool) error
+	ProcessNamespace(key string, deleted bool) error
+	ProcessLease(key string, deleted bool) error
 	ProcessControlPlanePod(pod *corev1.Pod) error
 	SweepControlPlane()
 	SweepTLSSecrets()
 	// SetListers installs every informer-backed lookup in one call, once the
 	// controller has wired its informers.
 	SetListers(Listers)
+	SetNamespaceScope(namespaces []string, all bool)
 	SetBaseline(baseline map[string]map[string]int64)
 	SetActiveNodeIncidents(nodeNames []string)
 	ClearBaselineForPod(namespace, podName string)
@@ -49,6 +55,7 @@ type Handler interface {
 		severity model.Severity,
 	)
 	ProcessClusterAutoscalerEvent(ev *corev1.Event)
+	ProcessWarningEvent(ev *corev1.Event)
 }
 
 // handler is the central event processor: informers call its Process*
@@ -69,7 +76,9 @@ type handler struct {
 	containerSuppressionEnrichers []filter.Enricher
 	containerDataEnrichers        []filter.Enricher
 
-	listers Listers
+	listers           Listers
+	namespaceScope    map[string]struct{}
+	namespaceScopeAll bool
 
 	fs firstSeenSet
 }
@@ -175,22 +184,25 @@ func (h *handler) report(
 // ContainerState from the signal fields or uses the pre-built one.
 func (h *handler) signalEvent(s *event.Signal) {
 	ev := event.Event{
-		Resource:      s.Resource,
-		PodName:       s.PodName,
-		Namespace:     s.Namespace,
-		NodeName:      s.NodeName,
-		ContainerName: s.Container,
-		Image:         s.Image,
-		Message:       s.Message,
-		Reason:        s.Reason,
-		Events:        s.Events,
-		Logs:          s.Logs,
-		Labels:        s.Labels,
-		OwnerKind:     s.OwnerKind,
-		RestartCount:  int(s.RestartCount),
-		Hint:          s.Hint,
-		Facts:         s.Facts,
-		Severity:      s.Severity,
+		Resource:        s.Resource,
+		PodName:         s.PodName,
+		PodUID:          s.PodUID,
+		PodLineageID:    s.PodLineageID,
+		PodGenerateName: s.PodGenerateName,
+		Namespace:       s.Namespace,
+		NodeName:        s.NodeName,
+		ContainerName:   s.Container,
+		Image:           s.Image,
+		Message:         s.Message,
+		Reason:          s.Reason,
+		Events:          s.Events,
+		Logs:            s.Logs,
+		Labels:          s.Labels,
+		OwnerKind:       s.OwnerKind,
+		RestartCount:    int(s.RestartCount),
+		Hint:            s.Hint,
+		Facts:           s.Facts,
+		Severity:        s.Severity,
 	}
 
 	if s.Message != "" && ev.Hint == "" {
