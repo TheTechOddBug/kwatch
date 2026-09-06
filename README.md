@@ -39,7 +39,7 @@ to act:
 Alerts can include the workload, owner, namespace, Pod, container, node,
 recent logs, Kubernetes events, related dependencies, and a suggested action.
 
-## 🚀 Install interactively
+## 🚀 Install with the kwatch manager
 
 The supported path is the interactive `kwatch.sh` manager. It:
 
@@ -59,40 +59,12 @@ You need Bash, `curl`, `kubectl`, and permission to install the required
 namespace-scoped and cluster-scoped resources.
 
 The manager selects the latest stable release by default. During installation
-and upgrade it offers the newest release candidate interactively when one is
-available.
-
-<!-- stable-install:start -->
-
-✅ **Stable:** **v0.10.5**
-
-Stable is the recommended channel for normal use. Credentials are stored in a
-Kubernetes Secret and the manager waits for kwatch to become ready.
-
-<!-- stable-install:end -->
-
-### 🧪 Preview builds
-
-<!-- rc-install:start -->
-
-The current preview is **v0.11.0-rc.7**. Select it interactively when you want
-to test preview changes. Preview builds are for testing; read the
-[release notes](https://github.com/abahmed/kwatch/releases) first.
-
-<!-- rc-install:end -->
+and upgrade it lets you choose the newest published release candidate
+interactively when one is available; no version parameter is required.
 
 Use the manager again after installation to configure alerts, change settings,
 upgrade, check status, or uninstall kwatch. Do not apply `deploy.yaml` or
 `config.yaml` manually; that bypasses guided Secret handling and verification.
-
-For a different namespace or release name, set environment variables before
-starting the manager:
-
-```bash
-KWATCH_NAMESPACE=platform-monitoring \
-KWATCH_RELEASE=kwatch-prod \
-  /bin/bash -c "$(curl -fsSL https://kwatch.dev/kwatch.sh)"
-```
 
 ## 🔔 What an alert looks like
 
@@ -109,22 +81,26 @@ KWATCH_RELEASE=kwatch-prod \
 
 ## 🔎 What kwatch monitors
 
-Most monitors are enabled by default:
+Core monitors are enabled by default; optional integrations are opt-in:
 
 | Area | Examples |
 | --- | --- |
 | Pods and containers | Crashes, OOM kills, restarts, and readiness |
 | Scheduling | Pending Pods, unschedulable workloads, and delay |
-| Workloads | Deployments, StatefulSets, DaemonSets, Jobs, and CronJobs |
+| Workloads | Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, and PDBs |
 | Infrastructure | Nodes, resource pressure, disk, and inode usage |
 | Storage | PVC usage and persistent-volume failures |
-| Traffic | Services, Ingress, webhooks, and NetworkPolicies |
+| Networking | Services, Ingress, webhooks, and NetworkPolicies |
 | Scaling | HPA and cluster-autoscaler signals |
 | Platform health | Control plane, kubelet telemetry, and cluster resources |
-| Security | TLS expiry, PDB issues, RBAC, and Pod Security findings |
+| Security and policy | TLS expiry, RBAC, admission, and Pod Security findings |
 
-Heartbeat notifications, Metrics Server usage, TLS monitoring, active probes,
-and custom-resource watching are opt-in. See the
+Heartbeat notifications, Metrics Server usage, TLS certificate monitoring, and
+active probes are opt-in. Generic custom-resource status checks use
+`clusterResourceMonitor` (enabled by default) and run only for resources the
+ServiceAccount can list and watch. The `KwatchConfig` overlay is enabled by
+Helm and the interactive installer, while the standalone binary defaults
+`crd.enabled` to false. See the
 [configuration reference](https://kwatch.dev/docs/general-configuration) for
 defaults, permissions, and thresholds.
 
@@ -168,8 +144,8 @@ configuration.
 | `correlation` | Track, resolve, cool down, and re-notify incidents |
 | `app.clusterName` | Identify the cluster in every alert |
 
-Run `kwatch lint` before applying a configuration. Add `--check` to verify
-credentials for providers that support checks.
+Run `kwatch lint` before restarting with an edited configuration. Add `--check`
+to verify credentials for providers that support checks.
 
 ## 🛠️ Manage the installation
 
@@ -181,7 +157,7 @@ configure-alert  Change the notification destination
 configure        Change monitors, thresholds, and silences
 upgrade          Upgrade to stable or choose an available RC
 status           Show deployment and manager state
-features         Show the installed feature catalog
+features         Show the capabilities of the installed release
 uninstall        Remove the workload and notification Secret
 ```
 
